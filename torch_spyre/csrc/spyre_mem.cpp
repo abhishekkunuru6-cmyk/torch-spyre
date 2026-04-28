@@ -19,6 +19,7 @@
 #include <ATen/EmptyTensor.h>
 #include <ATen/detail/PrivateUse1HooksInterface.h>
 #include <ATen/native/Resize.h>
+#include <ATen/ops/_copy_from.h>
 #include <ATen/ops/set_cpu_dispatch.h>
 #include <c10/core/MemoryFormat.h>
 #include <c10/core/TensorOptions.h>
@@ -580,10 +581,79 @@ at::Tensor py_empty_with_layout(
                            pin_memory_opt, memory_format_opt);
 }
 
+const at::Tensor& spyre_resize_(
+    const at::Tensor& self, c10::SymIntArrayRef size,
+    std::optional<c10::MemoryFormat> memory_format_opt) {
+  auto size_int = c10::asIntArrayRefUnchecked(size);
+
+  if (self.sizes() == size_int) {
+    return self;
+  }
+
+  TORCH_CHECK(!memory_format_opt.has_value() ||
+                  *memory_format_opt == c10::MemoryFormat::Contiguous,
+              "aten::resize_ on Spyre only supports contiguous memory format");
+
+  const auto dtype = c10::typeMetaToScalarType(self.dtype());
+  TORCH_CHECK(spyre::is_supported_dtype(dtype),
+              "Spyre backend does not support dtype ", dtype);
+
+  auto new_layout = SpyreTensorLayout(size_int.vec(), dtype);
+  size_t new_size_bytes = get_device_size_in_bytes(new_layout);
+
+  std::vector<int64_t> new_strides(size_int.size());
+  int64_t stride = 1;
+  for (int i = static_cast<int>(size_int.size()) - 1; i >= 0; --i) {
+    new_strides[i] = stride;
+    stride *= size_int[i];
+  }
+
+  auto* spyre_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+
+  // A direct D2D copy cannot model the flat-byte reinterpretation that CPU
+  // resize_ performs: Spyre's tiled layout for (3,4) and (2,3) place the same
+  // logical elements at different physical byte offsets, so reading old-layout
+  // storage through new-layout offsets produces wrong values.
+  //
+  // Instead: D2H using old layout -> CPU resize_ (pure metadata) -> H2D using
+  // new layout. This matches the CPU resize_ semantic of reinterpreting the
+  // flat storage bytes with new contiguous strides.
+  auto cpu_buf = self.cpu();
+  cpu_buf.resize_(size_int);
+
+  auto new_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
+      c10::StorageImpl::use_byte_size_t(), new_size_bytes,
+      &SpyreAllocator::instance(),
+      /*resizeable=*/true);
+
+  at::Tensor tmp = at::detail::make_tensor_base<SpyreTensorImpl>(
+      c10::Storage(new_storage_impl), pu1_dks,
+      c10::scalarTypeToTypeMeta(dtype));
+  auto* tmp_impl = static_cast<SpyreTensorImpl*>(tmp.unsafeGetTensorImpl());
+  tmp_impl->set_sizes_contiguous(size_int);
+  tmp_impl->spyre_layout = new_layout;
+  tmp_impl->dma_sizes = size_int.vec();
+  tmp_impl->dma_strides = new_strides;
+  at::_copy_from(cpu_buf, tmp, /*non_blocking=*/false);
+
+  spyre_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
+  spyre_impl->set_sizes_contiguous(size_int);
+  spyre_impl->spyre_layout = new_layout;
+  spyre_impl->dma_sizes = size_int.vec();
+  spyre_impl->dma_strides = new_strides;
+
+  DEBUGINFO("resize_ to shape=", size_int,
+            " new_layout=", new_layout.toString());
+  return self;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
+  m.impl("_copy_from", TORCH_FN(spyre_copy_from));
+  m.impl("resize_", TORCH_FN(spyre_resize_));
 }
 
 }  // namespace spyre
