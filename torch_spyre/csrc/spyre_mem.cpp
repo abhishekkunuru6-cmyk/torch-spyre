@@ -586,10 +586,17 @@ const at::Tensor& spyre_resize_(
     std::optional<c10::MemoryFormat> memory_format_opt) {
   auto size_int = c10::asIntArrayRefUnchecked(size);
 
+  // No-op: requested shape already matches the current shape.
   if (self.sizes() == size_int) {
     return self;
   }
 
+  // Spyre tensors are always contiguous; treat Preserve as Contiguous.
+  if (memory_format_opt == c10::MemoryFormat::Preserve) {
+    memory_format_opt = c10::MemoryFormat::Contiguous;
+  }
+  // Reject non-contiguous formats (e.g. ChannelsLast) that Spyre cannot
+  // represent in hardware.
   TORCH_CHECK(!memory_format_opt.has_value() ||
                   *memory_format_opt == c10::MemoryFormat::Contiguous,
               "aten::resize_ on Spyre only supports contiguous memory format");
@@ -611,14 +618,11 @@ const at::Tensor& spyre_resize_(
   auto* spyre_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
   constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
 
-  // A direct D2D copy cannot model the flat-byte reinterpretation that CPU
-  // resize_ performs: Spyre's tiled layout for (3,4) and (2,3) place the same
-  // logical elements at different physical byte offsets, so reading old-layout
-  // storage through new-layout offsets produces wrong values.
-  //
-  // Instead: D2H using old layout -> CPU resize_ (pure metadata) -> H2D using
-  // new layout. This matches the CPU resize_ semantic of reinterpreting the
-  // flat storage bytes with new contiguous strides.
+  // TODO: Enhance to avoid the D2H -> CPU resize_ -> H2D round-trip. A direct
+  // D2D reinterpretation is incorrect because Spyre's tiled layout places the
+  // same logical elements at different physical byte offsets for different
+  // shapes, so reading old-layout storage through new-layout offsets produces
+  // wrong values.
   auto cpu_buf = self.cpu();
   cpu_buf.resize_(size_int);
 
@@ -627,6 +631,8 @@ const at::Tensor& spyre_resize_(
       &SpyreAllocator::instance(),
       /*resizeable=*/true);
 
+  // Build a temporary Spyre tensor backed by the new storage and copy the
+  // resized CPU buffer into it using the new tiled layout (H2D transfer).
   at::Tensor tmp = at::detail::make_tensor_base<SpyreTensorImpl>(
       c10::Storage(new_storage_impl), pu1_dks,
       c10::scalarTypeToTypeMeta(dtype));
@@ -637,6 +643,8 @@ const at::Tensor& spyre_resize_(
   tmp_impl->dma_strides = new_strides;
   at::_copy_from(cpu_buf, tmp, /*non_blocking=*/false);
 
+  // Swap storage and update all metadata on self in-place so the caller's
+  // tensor reference reflects the new shape, layout, and backing device memory.
   spyre_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
   spyre_impl->set_sizes_contiguous(size_int);
   spyre_impl->spyre_layout = new_layout;
