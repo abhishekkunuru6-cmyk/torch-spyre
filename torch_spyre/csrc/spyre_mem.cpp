@@ -666,10 +666,85 @@ at::Tensor py_empty_with_layout(
                            pin_memory_opt, memory_format_opt);
 }
 
+const at::Tensor& spyre_resize_(
+    const at::Tensor& self, c10::SymIntArrayRef size,
+    std::optional<c10::MemoryFormat> memory_format_opt) {
+  auto size_int = c10::asIntArrayRefUnchecked(size);
+  // Case 1: No-op.
+  if (self.sizes() == size_int) return self;
+  // Spyre tensors are always contiguous; treat Preserve as Contiguous.
+  if (memory_format_opt == c10::MemoryFormat::Preserve)
+    memory_format_opt = c10::MemoryFormat::Contiguous;
+  TORCH_CHECK(!memory_format_opt.has_value() ||
+                  *memory_format_opt == c10::MemoryFormat::Contiguous,
+              "aten::resize_ on Spyre only supports contiguous memory format");
+  const auto dtype = c10::typeMetaToScalarType(self.dtype());
+  TORCH_CHECK(spyre::is_supported_dtype(dtype),
+              "Spyre backend does not support dtype ", dtype);
+  // Compute contiguous strides for the new shape.
+  std::vector<int64_t> new_strides(size_int.size());
+  {
+    int64_t s = 1;
+    for (int i = static_cast<int>(size_int.size()) - 1; i >= 0; --i) {
+      new_strides[i] = s;
+      s *= size_int[i];
+    }
+  }
+  int64_t new_numel = 1;
+  for (auto d : size_int) new_numel *= d;
+  const int64_t old_numel = self.numel();
+  auto* self_impl = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl());
+  // Case 2: Same-numel or shrink — metadata-only update, no reallocation.
+  //
+  // spyre_layout, dma_sizes, and dma_strides describe the physical allocation
+  // and are left unchanged.  Only the logical sizes/strides are updated.
+  if (new_numel <= old_numel) {
+    self_impl->set_sizes_and_strides(size_int, c10::IntArrayRef(new_strides));
+    DEBUGINFO("resize_ to shape=", size_int,
+              " layout=", self_impl->spyre_layout.toString());
+    return self;
+  }
+  // Case 3: Expand — allocate new storage and copy existing data via CPU.
+  //
+  // TODO(kunuruabhishek): Enhance to avoid the D2H -> CPU resize_ -> H2D
+  // round-trip once restickify supports cross-layout D2D copies (i.e., src and
+  // dst tensors with different stick dimensions).
+
+  auto new_layout = SpyreTensorLayout(size_int.vec(), dtype);
+  const size_t new_size_bytes = get_device_size_in_bytes(new_layout);
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+  auto new_storage_impl = c10::make_intrusive<SpyreStorageImpl>(
+      c10::StorageImpl::use_byte_size_t(), new_size_bytes,
+      &SpyreAllocator::instance(), /*resizeable=*/true);
+  at::Tensor tmp = at::detail::make_tensor_base<SpyreTensorImpl>(
+      c10::Storage(new_storage_impl), pu1_dks,
+      c10::scalarTypeToTypeMeta(dtype));
+  auto* tmp_impl = static_cast<SpyreTensorImpl*>(tmp.unsafeGetTensorImpl());
+  tmp_impl->set_sizes_contiguous(size_int);
+  tmp_impl->spyre_layout = new_layout;
+  tmp_impl->dma_sizes = size_int.vec();
+  tmp_impl->dma_strides = new_strides;
+  at::Tensor cpu_buf = self.cpu();
+
+  cpu_buf.resize_(size_int);
+
+  at::_copy_from(cpu_buf, tmp, /*non_blocking=*/false);
+
+  self_impl->set_storage_keep_dtype(c10::Storage(new_storage_impl));
+  self_impl->set_sizes_contiguous(size_int);
+  self_impl->spyre_layout = new_layout;
+  self_impl->dma_sizes = size_int.vec();
+  self_impl->dma_strides = new_strides;
+  DEBUGINFO("resize_ expand to shape=", size_int,
+            " layout=", self_impl->spyre_layout.toString());
+  return self;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
+  m.impl("resize_", TORCH_FN(spyre_resize_));
 }
 
 }  // namespace spyre
