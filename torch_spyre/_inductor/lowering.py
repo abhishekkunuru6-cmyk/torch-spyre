@@ -1060,7 +1060,7 @@ def to_dtype(x, dst_dtype):
         return clone(x)
 
     # Check if conversion is supported by backend
-    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
+    if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)

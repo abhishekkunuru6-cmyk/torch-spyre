@@ -350,7 +350,18 @@ class SpyreOpFuncs:
     def to_dtype(x, dtype, src_dtype):
         assert dtype != src_dtype
 
-        op = DtypeOpTable.get_operator(src_dtype, dtype)
+        if src_dtype == torch.bool:
+            # A bool's logical dtype doesn't reveal its physical on-device
+            # format (16-bit SEN169_FP16 vs 32-bit IEEE_FP32 -- it depends
+            # on how it was produced), so the static table can't resolve
+            # this conversion. Resolve it from the source's actual,
+            # already-propagated physical format instead.
+            op = DtypeOpTable.get_bool_src_operator(
+                x.layout.device_layout.device_dtype, dtype
+            )
+        else:
+            op = DtypeOpTable.get_operator(src_dtype, dtype)
+
         if op is None:
             raise Unsupported(f"type conversion from {src_dtype} to {dtype}")
 

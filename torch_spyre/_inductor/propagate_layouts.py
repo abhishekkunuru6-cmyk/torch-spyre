@@ -40,11 +40,13 @@ from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import (
+    DataFormats,
     ElementArrangement,
     SpyreTensorLayout,
     get_device_dtype,
     get_elem_in_stick,
 )
+from .dtype_ops import bool_equivalent_dtype
 from .errors import Unsupported
 from . import config
 from .constants import (
@@ -112,6 +114,25 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
     return get_elem_in_stick(t1) == get_elem_in_stick(t2)
 
 
+def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
+    """Infer the on-device format for a torch.bool pointwise output.
+
+    Spyre has no native bool representation: a bool result physically reuses
+    whichever hardware format its producing operands have (e.g. comparing two
+    float16 tensors yields a 16-bit-wide SEN169_FP16 bool, comparing two
+    float32 tensors yields a 32-bit-wide IEEE_FP32 one). PyTorch type
+    promotion guarantees pointwise operands share a physical format, so any
+    candidate device layout of any operand reveals the answer.
+    """
+    formats = {stl.device_dtype for arg in args for stl in arg.layouts}
+    if len(formats) != 1 or bool_equivalent_dtype(next(iter(formats))) is None:
+        raise Unsupported(
+            f"torch.bool result from operands with device format(s) {formats}"
+        )
+    (device_dtype,) = formats
+    return device_dtype
+
+
 def _single_arg_op_layout(
     op: Operation,
     output: FixedLayout,
@@ -151,10 +172,25 @@ def _single_arg_op_layout(
             # Concretize for C++ SpyreTensorLayout constructor.
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
+            # Clone doesn't change physical representation, so a bool
+            # output's physical format must match its (only) input's --
+            # the static get_device_dtype(torch.bool) mapping can't
+            # express that (see bool_equivalent_dtype). Substitute the
+            # input's equivalent logical dtype to construct an identical,
+            # correctly-formatted SpyreTensorLayout.
+            dtype_for_layout = (
+                bool_equivalent_dtype(stl.device_dtype)
+                if output.dtype == torch.bool
+                else output.dtype
+            )
+            if dtype_for_layout is None:
+                raise Unsupported(
+                    f"torch.bool clone of operand with device format {stl.device_dtype}"
+                )
             return SpyreTensorLayout(
                 c_size,
                 c_stride,
-                output.dtype,
+                dtype_for_layout,
                 list(range(len(output.size))),
             )
 
@@ -164,7 +200,18 @@ def _single_arg_op_layout(
             # which becomes 64 FP32 elements when converted. We need to reflect this
             # in the output host size so the constructor creates the correct device layout.
 
-            in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
+            # A bool's logical dtype doesn't reveal its physical format --
+            # get_elem_in_stick(torch.bool) always assumes 16-bit
+            # SEN169_FP16, which is wrong for e.g. a float32 comparison's
+            # result (see bool_equivalent_dtype). Read the actual,
+            # already-propagated physical format off `stl` instead, which
+            # is correct for both bool and non-bool inputs.
+            in_elems_per_stick = stl.elems_per_stick()
+            in_equivalent_dtype = (
+                bool_equivalent_dtype(stl.device_dtype)
+                if in_layout.dtype == torch.bool
+                else in_layout.dtype
+            )
             stick_dim_size = in_layout.size[-1]
             unaligned = stick_dim_size % in_elems_per_stick
 
@@ -176,7 +223,7 @@ def _single_arg_op_layout(
 
                 fmt = (
                     ElementArrangement.DL16_TO_FP32
-                    if in_layout.dtype == torch.float16
+                    if in_equivalent_dtype == torch.float16
                     and output.dtype == torch.float32
                     else ElementArrangement.STANDARD
                 )
@@ -200,6 +247,25 @@ def _single_arg_op_layout(
         case _:
             in_coords = host_coordinates(in_layout, dep)
             out_coords = host_coordinates(output, output_dep)
+
+            if output.dtype == torch.bool:
+                # The only ops reaching this generic branch are dtype-
+                # preserving data movement (reshape/transpose/etc), so a
+                # bool output's physical format must match its (only)
+                # input's -- the static get_device_dtype(torch.bool)
+                # mapping can't express that (see bool_equivalent_dtype).
+                # Reuse the input's actual, already-propagated physical
+                # format / equivalent logical dtype directly.
+                out_device_dtype = stl.device_dtype
+                out_dtype_for_layout = bool_equivalent_dtype(stl.device_dtype)
+                if out_dtype_for_layout is None:
+                    raise Unsupported(
+                        f"torch.bool result of operand with device format {stl.device_dtype}"
+                    )
+            else:
+                out_device_dtype = get_device_dtype(output.dtype)
+                out_dtype_for_layout = output.dtype
+
             if (
                 in_coords == out_coords
                 and in_layout.size == output.size
@@ -211,7 +277,7 @@ def _single_arg_op_layout(
                 return SpyreTensorLayout(
                     stl.device_size,
                     stl.stride_map,
-                    get_device_dtype(output.dtype),
+                    out_device_dtype,
                 )
             else:
                 # TODO: We should be able to preserve the input stride_map
@@ -237,7 +303,7 @@ def _single_arg_op_layout(
                 # Concretize for C++ SpyreTensorLayout constructor.
                 c_size = [concretize_expr(s) for s in output.size]
                 c_stride = [concretize_expr(s) for s in output.stride]
-                return SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+                return SpyreTensorLayout(c_size, c_stride, out_dtype_for_layout, dim_order)
 
 
 def _exx2_layout(
@@ -462,6 +528,20 @@ def _multi_arg_pointwise_layouts(
                 can_use_same_layout = False
                 break
 
+    if output.dtype == torch.bool:
+        # A bool output's physical format isn't determined by its logical
+        # dtype (get_device_dtype always maps torch.bool -> SEN169_FP16,
+        # which is wrong for e.g. a float32 comparison's result -- see
+        # infer_bool_device_dtype). Resolve it from the operands instead,
+        # and substitute the equivalent logical dtype where a constructor
+        # only accepts one -- it produces an identical SpyreTensorLayout
+        # since SpyreTensorLayout never stores a logical dtype.
+        out_device_dtype = infer_bool_device_dtype(args)
+        out_dtype_for_layout = bool_equivalent_dtype(out_device_dtype)
+    else:
+        out_device_dtype = get_device_dtype(output.dtype)
+        out_dtype_for_layout = output.dtype
+
     results: list[SpyreTensorLayout] = []
     # Sort stick exprs for determinism
     for stick_expr in sorted(stick_exprs, key=iter_var_id) if stick_exprs else [None]:
@@ -470,7 +550,7 @@ def _multi_arg_pointwise_layouts(
             stl = SpyreTensorLayout(
                 template_stl.device_size,
                 template_stl.stride_map,
-                get_device_dtype(output.dtype),
+                out_device_dtype,
             )
         else:
             if stick_expr is None:
@@ -491,7 +571,7 @@ def _multi_arg_pointwise_layouts(
             dim_order += [out_stick_dim]
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
-            stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+            stl = SpyreTensorLayout(c_size, c_stride, out_dtype_for_layout, dim_order)
         results.append(stl)
     op.restick_cost_fn = AllSameNode.from_args(args, results, output_dep)
     return results
