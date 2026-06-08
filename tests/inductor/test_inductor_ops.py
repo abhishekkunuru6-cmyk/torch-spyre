@@ -3796,6 +3796,56 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        # storage_offset fix (#1476): stick-aligned offsets, via the
+        # tensor_byte_offsets fast-path in executeProgramAsync.
+        ("test_storage_offset_stick_aligned", "test_storage_offset_binary_op"): {
+            "ops_dict": {"add": torch.add, "sub": torch.sub, "mul": torch.mul},
+            "param_sets": {
+                "1d_off64": (
+                    cached_randn((320,), differentiation="sa_x"),
+                    cached_randn((320,), differentiation="sa_y"),
+                    64,  # byte_offset = 128 (1 stick)
+                ),
+                "1d_off128": (
+                    cached_randn((384,), differentiation="sa_x"),
+                    cached_randn((384,), differentiation="sa_y"),
+                    128,  # byte_offset = 256 (2 sticks)
+                ),
+                "2d_off1": (
+                    cached_randn((5, 256), differentiation="sa_x"),
+                    cached_randn((5, 256), differentiation="sa_y"),
+                    1,  # row stride = 256 fp16 → byte_offset = 512 (4 sticks)
+                ),
+                "3d_off1": (
+                    cached_randn((3, 4, 256), differentiation="sa_x"),
+                    cached_randn((3, 4, 256), differentiation="sa_y"),
+                    1,  # row stride = 1024 fp16 → byte_offset = 2048 (16 sticks)
+                ),
+            },
+        },
+        # Sub-stick offsets: rejected at compile time by
+        # reject_sub_stick_offsets until on-device support lands.
+        ("test_storage_offset_sub_stick", "test_storage_offset_binary_op"): {
+            "ops_dict": {"add": torch.add, "sub": torch.sub, "mul": torch.mul},
+            "param_sets": {
+                "1d_off3": (
+                    cached_randn((259,), differentiation="ss_x"),
+                    cached_randn((259,), differentiation="ss_y"),
+                    3,  # byte_offset = 6
+                ),
+                "1d_off67": (
+                    cached_randn((323,), differentiation="ss_x"),
+                    cached_randn((323,), differentiation="ss_y"),
+                    67,  # byte_offset = 134, 67 % 64 == 3
+                ),
+                "2d_off1_w67": (
+                    cached_randn((5, 67), differentiation="ss_x"),
+                    cached_randn((5, 67), differentiation="ss_y"),
+                    1,  # row stride = 67 fp16 → byte_offset = 134
+                ),
+            },
+            "expect_fail": ["1d_off3", "1d_off67", "2d_off1_w67"],
+        },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
                 "1x3x32_ksize3_no_pad": (
@@ -3992,6 +4042,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             b[tiny_value_mask] = FP16_EPS
 
         self.compare_with_cpu(op, a, b)
+
+    def test_storage_offset_binary_op(self, op, x_base, y_base, offset):
+        # Slicing gives x/y a non-zero storage_offset (see #1476).
+        def fn(x, y):
+            return op(x[offset:], y[offset:])
+
+        self.compare_with_cpu(fn, x_base, y_base, clone_inputs=True, run_eager=False)
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):

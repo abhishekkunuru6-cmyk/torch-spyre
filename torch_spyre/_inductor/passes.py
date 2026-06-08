@@ -138,6 +138,73 @@ def _uuid(passes: list[Callable]) -> Optional[Any]:
     return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
+def reject_sub_stick_offsets(graph: torch.fx.Graph) -> None:
+    """Raise at compile time if a sub-stick storage_offset reaches on-device
+    compute.
+
+    SuperDSC can't express the cross-stick carry
+    (d0 + floor((d1 + offset) / 64)) that a sub-stick offset
+    (byte_offset % 128 != 0) needs in a compute kernel's index expressions, so
+    such tensors aren't yet supported as compute inputs. Pure views that only
+    flow to the device-to-host copy (which handles arbitrary byte offsets via
+    a strided DMA) are unaffected. Stick-aligned offsets are handled by
+    tensor_byte_offsets in executeProgramAsync (C++) and also unaffected.
+    """
+    _STICK_BYTES = 128
+
+    def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+        return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+
+    def _only_reaches_outputs(
+        node: torch.fx.Node, val: torch.Tensor, visited: set
+    ) -> bool:
+        """True if `val` is never read by a node that computes on it — every
+        consumer is a graph output or another view of the same storage."""
+        if node in visited:
+            return True
+        visited.add(node)
+        for user in node.users:
+            if user.op == "output":
+                continue
+            user_val = user.meta.get("val")
+            if (
+                isinstance(user_val, torch.Tensor)
+                and _shares_storage(val, user_val)
+                and _only_reaches_outputs(user, user_val, visited)
+            ):
+                continue
+            return False
+        return True
+
+    for node in graph.nodes:
+        if node.op in ("output", "get_attr"):
+            continue
+
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        if getattr(val.device, "type", None) != DEVICE_NAME:
+            continue
+
+        offset = val.storage_offset()
+        if offset == 0:
+            continue
+
+        byte_offset = offset * val.element_size()
+        if byte_offset % _STICK_BYTES == 0:
+            continue  # stick-aligned: handled by tensor_byte_offsets in C++
+
+        if _only_reaches_outputs(node, val, set()):
+            continue  # pure view copied back to host as-is — never computed on
+
+        raise RuntimeError(
+            f"{node.name}: storage_offset={offset} elements "
+            f"(byte_offset={byte_offset}) is not stick-aligned "
+            f"(byte_offset % {_STICK_BYTES} != 0). Sub-stick storage offsets "
+            "are not yet supported as compute inputs on Spyre."
+        )
+
+
 class _SpyreGraphPassPipeline(CustomGraphPass):
     """Pipeline over a post-grad FX graph, guarded by Spyre-device presence."""
 
@@ -194,7 +261,7 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([reject_sub_stick_offsets, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):

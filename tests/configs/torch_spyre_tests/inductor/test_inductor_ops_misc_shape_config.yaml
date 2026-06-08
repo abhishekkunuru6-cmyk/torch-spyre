@@ -31,11 +31,13 @@ test_suite_config:
             # copy / clone
             - TestOps::test_clone.*
             - TestOps::test_copy_roundtrip.*
-            # concat / split / slice / pad
+            # concat / split / slice / pad / storage_offset
             - TestOps::test_cat.*
             - TestOps::test_pad.*
             - TestOps::test_slice.*
             - TestOps::test_split.*
+            - TestOps::test_storage_offset_stick_aligned.*
+            - TestOps::test_storage_offset_sub_stick.*
             # shape ops
             - TestOps::test_flatten.*
             - TestOps::test_permute.*
