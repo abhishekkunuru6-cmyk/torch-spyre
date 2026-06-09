@@ -837,7 +837,17 @@ def _per_core_view_on_buf(
     has_partial_reduction = any(n > 1 for n in coeff_splits[1].values())
     splits_by_stride: dict[int, tuple[int, "sympy.Symbol"]] = {}
     for sym, split in per_sym.items():
-        host_stride = int(dep.index.coeff(sym))
+        host_stride_expr = dep.index.coeff(sym)
+        if not host_stride_expr.is_number:
+            # Symbolic stride (e.g. a transposed/strided view in a
+            # shape-polymorphic d2d copy): the split can't be placed on
+            # this buffer's geometry, so conservatively treat the buffer
+            # as non-partitionable instead of crashing in int().
+            result = (empty_view[0], has_partial_reduction)
+            if cache is not None:
+                cache[key] = result
+            return result
+        host_stride = int(host_stride_expr)
         if split <= 1 or host_stride == 0:
             continue
         splits_by_stride[host_stride] = (int(split), sym)
