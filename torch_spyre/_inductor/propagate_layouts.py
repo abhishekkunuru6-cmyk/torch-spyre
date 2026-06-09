@@ -792,6 +792,7 @@ def propagate_spyre_tensor_layouts(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
+                ptl.offset = sympy.Integer(real_input.storage_offset())
                 tb.layouts = [stl]
 
     # Operations are in topological order (guaranteed by GraphLowering).

@@ -62,7 +62,10 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+from .pass_utils import (
+    apply_splits_from_index_coeff,
+    iteration_space_from_op,
+)
 from .scratchpad.allocator import (
     StrategyBCoOptimizingAllocator,
     scratchpad_planning,
@@ -138,6 +141,45 @@ def _uuid(passes: list[Callable]) -> Optional[Any]:
     return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
+class _SpyreGraphPassPipeline(CustomGraphPass):
+    """Pipeline over a post-grad FX graph, guarded by Spyre-device presence."""
+
+    def __init__(self, passes: list[Callable]):
+        self.passes = passes
+
+    def _has_spyre_device(self, target: torch.fx.graph.Graph) -> bool:
+        return _graph_has_spyre_device(target)
+
+    def __call__(self, graph: torch.fx.graph.Graph) -> None:
+        if not self._has_spyre_device(graph):
+            return
+        for p in self.passes:
+            p(graph)
+
+    def uuid(self) -> Any | None:
+        return _uuid(self.passes)
+
+
+class _SpyreNodePassPipeline(CustomSchedulerPass):
+    """Pipeline over a list of scheduler nodes; each pass returns the new list."""
+
+    def __init__(self, passes: list[Callable]):
+        self.passes = passes
+
+    def _has_spyre_device(self, target: list[BaseSchedulerNode]) -> bool:
+        return _nodes_have_spyre_device(target)
+
+    def __call__(self, target: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+        if not self._has_spyre_device(target):
+            return target
+        for pass_fn in self.passes:
+            target = pass_fn(target)
+        return target
+
+    def uuid(self) -> Any | None:
+        return _uuid(self.passes)
+
+
 def reject_sub_stick_offsets(graph: torch.fx.Graph) -> None:
     """Raise at compile time if a sub-stick storage_offset reaches on-device
     compute.
@@ -147,8 +189,8 @@ def reject_sub_stick_offsets(graph: torch.fx.Graph) -> None:
     (byte_offset % 128 != 0) needs in a compute kernel's index expressions, so
     such tensors aren't yet supported as compute inputs. Pure views that only
     flow to the device-to-host copy (which handles arbitrary byte offsets via
-    a strided DMA) are unaffected. Stick-aligned offsets are handled by
-    tensor_byte_offsets in executeProgramAsync (C++) and also unaffected.
+    a strided DMA) are unaffected. Stick-aligned offsets are encoded in the
+    SDSC JSON start_address at compile time and also unaffected.
     """
     _STICK_BYTES = 128
 
@@ -192,7 +234,7 @@ def reject_sub_stick_offsets(graph: torch.fx.Graph) -> None:
 
         byte_offset = offset * val.element_size()
         if byte_offset % _STICK_BYTES == 0:
-            continue  # stick-aligned: handled by tensor_byte_offsets in C++
+            continue  # stick-aligned: encoded in SDSC JSON start_address at compile time
 
         if _only_reaches_outputs(node, val, set()):
             continue  # pure view copied back to host as-is — never computed on
@@ -203,45 +245,6 @@ def reject_sub_stick_offsets(graph: torch.fx.Graph) -> None:
             f"(byte_offset % {_STICK_BYTES} != 0). Sub-stick storage offsets "
             "are not yet supported as compute inputs on Spyre."
         )
-
-
-class _SpyreGraphPassPipeline(CustomGraphPass):
-    """Pipeline over a post-grad FX graph, guarded by Spyre-device presence."""
-
-    def __init__(self, passes: list[Callable]):
-        self.passes = passes
-
-    def _has_spyre_device(self, target: torch.fx.graph.Graph) -> bool:
-        return _graph_has_spyre_device(target)
-
-    def __call__(self, graph: torch.fx.graph.Graph) -> None:
-        if not self._has_spyre_device(graph):
-            return
-        for p in self.passes:
-            p(graph)
-
-    def uuid(self) -> Any | None:
-        return _uuid(self.passes)
-
-
-class _SpyreNodePassPipeline(CustomSchedulerPass):
-    """Pipeline over a list of scheduler nodes; each pass returns the new list."""
-
-    def __init__(self, passes: list[Callable]):
-        self.passes = passes
-
-    def _has_spyre_device(self, target: list[BaseSchedulerNode]) -> bool:
-        return _nodes_have_spyre_device(target)
-
-    def __call__(self, target: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
-        if not self._has_spyre_device(target):
-            return target
-        for pass_fn in self.passes:
-            target = pass_fn(target)
-        return target
-
-    def uuid(self) -> Any | None:
-        return _uuid(self.passes)
 
 
 class CustomPreGradPasses(_SpyreGraphPassPipeline):
