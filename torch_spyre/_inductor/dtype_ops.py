@@ -30,13 +30,9 @@ from torch_spyre._inductor.constants import (
     FP32TODL16_OP,
 )
 
-# Spyre has no native bool representation: a torch.bool tensor physically
-# reuses whichever hardware format produced it (e.g. comparing two float16
-# tensors yields a 16-bit-wide SEN169_FP16 bool, comparing two float32
-# tensors yields a 32-bit-wide IEEE_FP32 bool). This maps each physical
-# format a bool can take to the logical dtype that natively uses that same
-# format, so a bool's conversions can be resolved by treating it as if it
-# were that equivalent dtype (see DtypeOpTable.get_bool_src_operator).
+# Spyre has no native bool: a bool tensor reuses whichever physical format
+# produced it (e.g. fp16 vs fp32 comparison results). Maps that format to
+# the logical dtype that natively uses it.
 _BOOL_EQUIVALENT_DTYPES: Mapping[DataFormats, torch.dtype] = {
     DataFormats.SEN169_FP16: torch.float16,
     DataFormats.IEEE_FP32: torch.float32,
@@ -44,23 +40,15 @@ _BOOL_EQUIVALENT_DTYPES: Mapping[DataFormats, torch.dtype] = {
 
 
 def bool_equivalent_dtype(device_dtype: DataFormats) -> Optional[torch.dtype]:
-    """Logical dtype that natively uses the same physical format as a bool.
-
-    Returns None if `device_dtype` has no known bool-compatible equivalent,
-    i.e. a bool with that physical format isn't supported.
-    """
+    """Logical dtype matching a bool's physical format, or None if unsupported."""
     return _BOOL_EQUIVALENT_DTYPES.get(device_dtype)
 
 
 class DtypeOpTable:
     _IDENTITY_DTYPES = [
-        # float16 -> bool: the bool result reuses float16's physical format
-        # (a bool inherits its producing operand's physical width -- see
-        # bool_equivalent_dtype), so this is a same-width reinterpret.
-        # NOTE: the reverse, bool -> float16, is *not* always identity --
-        # a bool can also be 32-bit (e.g. produced by comparing float32
-        # tensors), so it is resolved dynamically from the source's actual
-        # physical format instead -- see get_bool_src_operator.
+        # float16 -> bool is a same-width reinterpret. bool -> float16 is
+        # NOT always identity (bool may be 32-bit), so it's resolved
+        # dynamically via get_bool_src_operator instead.
         (torch.float16, torch.bool),
         (torch.float16, torch.bfloat16),
         (torch.bfloat16, torch.float16),
@@ -97,12 +85,8 @@ class DtypeOpTable:
     ) -> Optional[str]:
         """Resolve the conversion op for a torch.bool source tensor.
 
-        A bool's logical dtype alone doesn't determine its physical format
-        (see bool_equivalent_dtype), so bool sources can't be looked up in
-        the static table above by logical dtype pair. Instead, treat the
-        bool as if it were the dtype that's physically equivalent to its
-        actual, already-propagated `device_dtype`, and resolve the op for
-        that pair (an identity reinterpret if the formats already match).
+        Treats the bool as its physically-equivalent dtype (from
+        `device_dtype`) and resolves the op for that pair.
         """
         equivalent_src_dtype = bool_equivalent_dtype(device_dtype)
         if equivalent_src_dtype is None:
@@ -115,10 +99,8 @@ class DtypeOpTable:
     def is_supported(cls, src_dtype: torch.dtype, dst_dtype: torch.dtype) -> bool:
         """Whether Spyre can natively perform this dtype conversion.
 
-        For torch.bool sources the concrete op depends on the tensor's
-        physical format, which isn't known until layout propagation runs
-        (see get_bool_src_operator); this only checks whether *some*
-        physical format of a bool source could convert to dst_dtype.
+        For torch.bool sources, checks whether *some* physical format
+        could convert to dst_dtype (see get_bool_src_operator).
         """
         if src_dtype == torch.bool:
             return dst_dtype in _BOOL_EQUIVALENT_DTYPES.values()

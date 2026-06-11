@@ -351,11 +351,8 @@ class SpyreOpFuncs:
         assert dtype != src_dtype
 
         if src_dtype == torch.bool:
-            # A bool's logical dtype doesn't reveal its physical on-device
-            # format (16-bit SEN169_FP16 vs 32-bit IEEE_FP32 -- it depends
-            # on how it was produced), so the static table can't resolve
-            # this conversion. Resolve it from the source's actual,
-            # already-propagated physical format instead.
+            # A bool's physical format (fp16 vs fp32) depends on how it was
+            # produced, so resolve the op from its propagated device dtype.
             op = DtypeOpTable.get_bool_src_operator(
                 x.layout.device_layout.device_dtype, dtype
             )

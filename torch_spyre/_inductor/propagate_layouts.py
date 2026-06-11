@@ -117,12 +117,9 @@ def same_device_size(t1: torch.dtype, t2: torch.dtype) -> bool:
 def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
     """Infer the on-device format for a torch.bool pointwise output.
 
-    Spyre has no native bool representation: a bool result physically reuses
-    whichever hardware format its producing operands have (e.g. comparing two
-    float16 tensors yields a 16-bit-wide SEN169_FP16 bool, comparing two
-    float32 tensors yields a 32-bit-wide IEEE_FP32 one). PyTorch type
-    promotion guarantees pointwise operands share a physical format, so any
-    candidate device layout of any operand reveals the answer.
+    A bool result reuses its producing operands' physical format. Type
+    promotion guarantees pointwise operands share one, so any operand's
+    device layout reveals it.
     """
     formats = {stl.device_dtype for arg in args for stl in arg.layouts}
     if len(formats) != 1 or bool_equivalent_dtype(next(iter(formats))) is None:
@@ -172,12 +169,9 @@ def _single_arg_op_layout(
             # Concretize for C++ SpyreTensorLayout constructor.
             c_size = [concretize_expr(s) for s in output.size]
             c_stride = [concretize_expr(s) for s in output.stride]
-            # Clone doesn't change physical representation, so a bool
-            # output's physical format must match its (only) input's --
-            # the static get_device_dtype(torch.bool) mapping can't
-            # express that (see bool_equivalent_dtype). Substitute the
-            # input's equivalent logical dtype to construct an identical,
-            # correctly-formatted SpyreTensorLayout.
+            # Clone preserves physical format, so a bool output must match
+            # its input's -- substitute the equivalent logical dtype since
+            # get_device_dtype(torch.bool) can't express that.
             dtype_for_layout = (
                 bool_equivalent_dtype(stl.device_dtype)
                 if output.dtype == torch.bool
@@ -200,12 +194,9 @@ def _single_arg_op_layout(
             # which becomes 64 FP32 elements when converted. We need to reflect this
             # in the output host size so the constructor creates the correct device layout.
 
-            # A bool's logical dtype doesn't reveal its physical format --
-            # get_elem_in_stick(torch.bool) always assumes 16-bit
-            # SEN169_FP16, which is wrong for e.g. a float32 comparison's
-            # result (see bool_equivalent_dtype). Read the actual,
-            # already-propagated physical format off `stl` instead, which
-            # is correct for both bool and non-bool inputs.
+            # get_elem_in_stick(torch.bool) assumes 16-bit SEN169_FP16,
+            # which is wrong for e.g. a float32 comparison's bool result.
+            # Read the actual physical format off `stl` instead.
             in_elems_per_stick = stl.elems_per_stick()
             in_equivalent_dtype = (
                 bool_equivalent_dtype(stl.device_dtype)
@@ -249,13 +240,9 @@ def _single_arg_op_layout(
             out_coords = host_coordinates(output, output_dep)
 
             if output.dtype == torch.bool:
-                # The only ops reaching this generic branch are dtype-
-                # preserving data movement (reshape/transpose/etc), so a
-                # bool output's physical format must match its (only)
-                # input's -- the static get_device_dtype(torch.bool)
-                # mapping can't express that (see bool_equivalent_dtype).
-                # Reuse the input's actual, already-propagated physical
-                # format / equivalent logical dtype directly.
+                # This branch is dtype-preserving data movement
+                # (reshape/transpose/etc), so reuse the input's physical
+                # format directly.
                 out_device_dtype = stl.device_dtype
                 out_dtype_for_layout = bool_equivalent_dtype(stl.device_dtype)
                 if out_dtype_for_layout is None:
@@ -303,7 +290,9 @@ def _single_arg_op_layout(
                 # Concretize for C++ SpyreTensorLayout constructor.
                 c_size = [concretize_expr(s) for s in output.size]
                 c_stride = [concretize_expr(s) for s in output.stride]
-                return SpyreTensorLayout(c_size, c_stride, out_dtype_for_layout, dim_order)
+                return SpyreTensorLayout(
+                    c_size, c_stride, out_dtype_for_layout, dim_order
+                )
 
 
 def _exx2_layout(
@@ -529,13 +518,9 @@ def _multi_arg_pointwise_layouts(
                 break
 
     if output.dtype == torch.bool:
-        # A bool output's physical format isn't determined by its logical
-        # dtype (get_device_dtype always maps torch.bool -> SEN169_FP16,
-        # which is wrong for e.g. a float32 comparison's result -- see
-        # infer_bool_device_dtype). Resolve it from the operands instead,
-        # and substitute the equivalent logical dtype where a constructor
-        # only accepts one -- it produces an identical SpyreTensorLayout
-        # since SpyreTensorLayout never stores a logical dtype.
+        # get_device_dtype always maps torch.bool -> SEN169_FP16, which is
+        # wrong for e.g. a float32 comparison's result. Resolve the
+        # physical format from the operands instead.
         out_device_dtype = infer_bool_device_dtype(args)
         out_dtype_for_layout = bool_equivalent_dtype(out_device_dtype)
     else:
