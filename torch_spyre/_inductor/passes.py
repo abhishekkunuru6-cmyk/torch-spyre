@@ -196,7 +196,10 @@ def reject_sub_stick_offsets(graph: torch.fx.Graph) -> None:
     _STICK_BYTES = 128
 
     def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
-        return a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+        # FakeTensor storages are backed by the meta allocator, which always
+        # returns a null data_ptr, so data_ptr() can't distinguish storages.
+        # Compare storage identity instead.
+        return id(a.untyped_storage()) == id(b.untyped_storage())
 
     def _only_reaches_outputs(
         node: torch.fx.Node, val: torch.Tensor, visited: set

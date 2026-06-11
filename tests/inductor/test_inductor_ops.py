@@ -3900,7 +3900,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         },
         # Sub-stick offsets: rejected at compile time by
         # reject_sub_stick_offsets until on-device support lands.
-        ("test_storage_offset_sub_stick", "test_storage_offset_binary_op"): {
+        ("test_storage_offset_sub_stick", "test_storage_offset_sub_stick_rejected"): {
             "ops_dict": {"add": torch.add, "sub": torch.sub, "mul": torch.mul},
             "param_sets": {
                 "1d_off3": (
@@ -3919,7 +3919,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,  # row stride = 67 fp16 → byte_offset = 134
                 ),
             },
-            "expect_fail": ["1d_off3", "1d_off67", "2d_off1_w67"],
         },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
@@ -4180,6 +4179,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return op(x[offset:], y[offset:])
 
         self.compare_with_cpu(fn, x_base, y_base, clone_inputs=True, run_eager=False)
+
+    def test_storage_offset_sub_stick_rejected(self, op, x_base, y_base, offset):
+        # A sub-stick storage_offset (byte_offset % 128 != 0) reaching
+        # on-device compute must be rejected at compile time by
+        # reject_sub_stick_offsets (see #1476), with its descriptive error,
+        # rather than failing for some unrelated downstream reason or
+        # silently producing wrong results.
+        def fn(x, y):
+            return op(x[offset:], y[offset:])
+
+        x = x_base.clone().to("spyre")
+        y = y_base.clone().to("spyre")
+
+        with pytest.raises(RuntimeError, match="is not stick-aligned"):
+            _compile_and_run(fn, [x, y], "spyre")
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):
