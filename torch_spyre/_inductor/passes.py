@@ -62,7 +62,10 @@ from .work_division import (
     work_distribution,
     cost_model_matmul_division,
 )
-from .pass_utils import apply_splits_from_index_coeff, iteration_space_from_op
+from .pass_utils import (
+    apply_splits_from_index_coeff,
+    iteration_space_from_op,
+)
 from .scratchpad.allocator import (
     StrategyBCoOptimizingAllocator,
     scratchpad_planning,
@@ -70,6 +73,7 @@ from .scratchpad.allocator import (
 from .fusion import spyre_fuse_nodes
 from .scheduler import build_loop_scheduler_nodes
 from .constants import DEVICE_NAME
+from .errors import Unsupported
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
 from .chunk_large_tensors import chunk_large_tensors
@@ -178,6 +182,75 @@ class _SpyreNodePassPipeline(CustomSchedulerPass):
         return _uuid(self.passes)
 
 
+def reject_sub_stick_offsets(graph: torch.fx.Graph) -> None:
+    """Raise at compile time if a sub-stick storage_offset reaches on-device
+    compute.
+
+    SuperDSC can't express the cross-stick carry
+    (d0 + floor((d1 + offset) / 64)) that a sub-stick offset
+    (byte_offset % 128 != 0) needs in a compute kernel's index expressions, so
+    such tensors aren't yet supported as compute inputs. Pure views that only
+    flow to the device-to-host copy (which handles arbitrary byte offsets via
+    a strided DMA) are unaffected. Stick-aligned offsets are encoded in the
+    SDSC JSON start_address at compile time and also unaffected.
+    """
+    _STICK_BYTES = 128
+
+    def _shares_storage(a: torch.Tensor, b: torch.Tensor) -> bool:
+        # FakeTensor storages are backed by the meta allocator, which always
+        # returns a null data_ptr, so data_ptr() can't distinguish storages.
+        # Compare storage identity instead.
+        return id(a.untyped_storage()) == id(b.untyped_storage())
+
+    def _only_reaches_outputs(
+        node: torch.fx.Node, val: torch.Tensor, visited: set
+    ) -> bool:
+        """True if `val` is never read by a node that computes on it — every
+        consumer is a graph output or another view of the same storage."""
+        if node in visited:
+            return True
+        visited.add(node)
+        for user in node.users:
+            if user.op == "output":
+                continue
+            user_val = user.meta.get("val")
+            if (
+                isinstance(user_val, torch.Tensor)
+                and _shares_storage(val, user_val)
+                and _only_reaches_outputs(user, user_val, visited)
+            ):
+                continue
+            return False
+        return True
+
+    for node in graph.nodes:
+        if node.op in ("output", "get_attr"):
+            continue
+
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        if getattr(val.device, "type", None) != DEVICE_NAME:
+            continue
+
+        offset = val.storage_offset()
+        if offset == 0:
+            continue
+
+        byte_offset = offset * val.element_size()
+        if byte_offset % _STICK_BYTES == 0:
+            continue  # stick-aligned: encoded in SDSC JSON start_address at compile time
+
+        if _only_reaches_outputs(node, val, set()):
+            continue  # pure view copied back to host as-is — never computed on
+
+        raise Unsupported(
+            f"{node.name}: storage_offset={offset} elements "
+            f"(byte_offset={byte_offset}) is not stick-aligned "
+            f"(byte_offset % {_STICK_BYTES} != 0) as a compute input"
+        )
+
+
 class CustomPreGradPasses(_SpyreGraphPassPipeline):
     """
     This inductor extension point enables Spyre-specific passes to run on the
@@ -195,7 +268,7 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([reject_sub_stick_offsets, collect_spyre_hints])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
