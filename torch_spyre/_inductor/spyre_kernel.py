@@ -823,17 +823,11 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
-            base = SEGMENT_OFFSETS[
+            tensor_arg.allocation["hbm"] = SEGMENT_OFFSETS[
                 tensor_arg.arg_index + 1
                 if has_pool_allocations
                 else tensor_arg.arg_index
             ]
-            buf_layout = V.graph.get_buffer(name).get_layout()
-            storage_offset_elems = concretize_expr(buf_layout.offset)
-            if storage_offset_elems:
-                elem_size = torch.empty(0, dtype=buf_layout.dtype).element_size()
-                base = base + storage_offset_elems * elem_size
-            tensor_arg.allocation["hbm"] = base
 
         buf = IndentedBuffer()
         buf.writeline("[")

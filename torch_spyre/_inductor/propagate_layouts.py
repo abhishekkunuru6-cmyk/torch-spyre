@@ -982,6 +982,20 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         operations.remove(op)
 
 
+def _contiguous_strides_for(size: tuple[int, ...]) -> tuple[int, ...]:
+    stride = [1] * len(size)
+    for i in range(len(size) - 2, -1, -1):
+        stride[i] = stride[i + 1] * size[i + 1]
+    return tuple(stride)
+
+
+def _logical_numel(size: tuple[int, ...]) -> int:
+    numel = 1
+    for s in size:
+        numel *= s
+    return numel
+
+
 def propagate_spyre_tensor_layouts(
     graph: GraphLowering,
 ) -> None:
@@ -1009,7 +1023,25 @@ def propagate_spyre_tensor_layouts(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                ptl.offset = sympy.Integer(real_input.storage_offset())
+                storage_offset = real_input.storage_offset()
+                view_stride = tuple(real_input.stride())
+                view_size = tuple(real_input.size())
+                base_numel = (
+                    real_input.untyped_storage().nbytes() // real_input.element_size()
+                )
+                is_view = (
+                    storage_offset != 0
+                    or view_stride != _contiguous_strides_for(view_size)
+                    or _logical_numel(view_size) != base_numel
+                )
+                if is_view:
+                    tb.data.data.layout = FixedLayout(
+                        device=ptl.device,
+                        dtype=ptl.dtype,
+                        size=list(view_size),
+                        stride=list(view_stride),
+                        offset=sympy.Integer(storage_offset),
+                    )
                 tb.layouts = [stl]
 
     # Operations are in topological order (guaranteed by GraphLowering).

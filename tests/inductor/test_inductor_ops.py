@@ -2982,6 +2982,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s2": (2, 128, 192, cached_randn((3, 3, 192))),
             },
         },
+        # Every param set in this group and the three test_slice_stick_reduce_dim*
+        # groups below slices the stick (last) dimension at an UNALIGNED offset
+        # (32, not a multiple of the 64-element stick size) -- that's the whole
+        # point of these groups, added to test PR #2595's restickify-rescue of
+        # unaligned stick-dim slices for the INTRA-GRAPH case. The compiled path
+        # still passes via that mechanism; the (newly-enabled) eager path now
+        # correctly raises, since `x[:, 32:96]` in eager builds a genuine
+        # on-device placeholder with the offset on its own metadata, which needs
+        # Step 2 (alt-layout retargeting, blocked on #2750) to work -- not yet
+        # implemented. All param sets here are expected to fail for that reason.
         ("test_slice_stick", "test_slice_cpu"): {
             "ops_dict": {
                 "clone": lambda _, x: torch.clone(x),
@@ -3000,6 +3010,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            "expect_fail": [
+                "2d64",
+                "2d128",
+                "3d64_0",
+                "3d64_1",
+                "3d64_01",
+                "3d128_0",
+                "3d128_1",
+                "3d128_01",
+            ],
         },
         ("test_slice_stick_reduce_dim0", "test_slice_cpu"): {
             "ops_dict": {
@@ -3016,6 +3036,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            "expect_fail": [
+                "2d64",
+                "2d128",
+                "3d64_0",
+                "3d64_1",
+                "3d64_01",
+                "3d128_0",
+                "3d128_1",
+                "3d128_01",
+            ],
         },
         ("test_slice_stick_reduce_dim1", "test_slice_cpu"): {
             "ops_dict": {
@@ -3032,6 +3062,16 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            "expect_fail": [
+                "2d64",
+                "2d128",
+                "3d64_0",
+                "3d64_1",
+                "3d64_01",
+                "3d128_0",
+                "3d128_1",
+                "3d128_01",
+            ],
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
@@ -3046,6 +3086,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
+            "expect_fail": [
+                "3d64_0",
+                "3d64_1",
+                "3d64_01",
+                "3d128_0",
+                "3d128_1",
+                "3d128_01",
+            ],
         },
         ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
             "param_sets": {
@@ -4201,52 +4249,76 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "4d_fp16_2x4x16": (cached_randn((2, 4, 16, 64), dtype=torch.float16),),
             },
         },
-        # storage_offset fix (#1476): stick-aligned offsets, via the
-        # SDSC JSON start_address compile-time path.
-        ("test_storage_offset_stick_aligned", "test_storage_offset_binary_op"): {
-            "ops_dict": {"add": torch.add, "sub": torch.sub, "mul": torch.mul},
+        # storage_offset fix (#1476), scoped to graph-input placeholders only
+        # (yoheiueda review: focus on non-stick-dim offsets/gaps on graph
+        # inputs first; intra-graph slices are PR #2595's territory and are
+        # untouched here). Each `slicer` is applied to the tensor AFTER
+        # `.to("spyre")` and BEFORE compile, so the offset/stride/gap lives
+        # on the placeholder's own FakeTensor, not on an intra-graph slice
+        # node.
+        #
+        # Non-stick dims (any dim except the last): expected to produce
+        # correct results via the existing index-expression/coordinate
+        # machinery, with no special-case handling.
+        ("test_storage_offset_placeholder", "test_storage_offset_placeholder"): {
+            "ops_dict": {"add": lambda x: x + x, "exp": torch.exp},
             "param_sets": {
-                "1d_off64": (
-                    cached_randn((320,), differentiation="sa_x"),
-                    cached_randn((320,), differentiation="sa_y"),
-                    64,  # byte_offset = 128 (1 stick)
+                "2d_offset_dim0": (
+                    lambda t: t[1:, :],
+                    cached_randn((5, 128), differentiation="ph_2d_offset0"),
                 ),
-                "1d_off128": (
-                    cached_randn((384,), differentiation="sa_x"),
-                    cached_randn((384,), differentiation="sa_y"),
-                    128,  # byte_offset = 256 (2 sticks)
+                "3d_offset_dim0": (
+                    lambda t: t[1:, :, :],
+                    cached_randn((5, 4, 128), differentiation="ph_3d_offset0"),
                 ),
-                "2d_off1": (
-                    cached_randn((5, 256), differentiation="sa_x"),
-                    cached_randn((5, 256), differentiation="sa_y"),
-                    1,  # row stride = 256 fp16 → byte_offset = 512 (4 sticks)
+                "3d_offset_dim1": (
+                    lambda t: t[:, 1:, :],
+                    cached_randn((4, 5, 128), differentiation="ph_3d_offset1"),
                 ),
-                "3d_off1": (
-                    cached_randn((3, 4, 256), differentiation="sa_x"),
-                    cached_randn((3, 4, 256), differentiation="sa_y"),
-                    1,  # row stride = 1024 fp16 → byte_offset = 2048 (16 sticks)
+                "3d_gap_dim1": (
+                    # offset (32 rows) + gap (32 unused trailing rows):
+                    # view.shape=[9,192,32] over base.shape=[9,256,32]
+                    lambda t: t[:, 32:224, :],
+                    cached_randn((9, 256, 32), differentiation="ph_3d_gap1"),
                 ),
             },
         },
-        # Sub-stick offsets: rejected at compile time by
-        # reject_sub_stick_offsets until on-device support lands.
-        ("test_storage_offset_sub_stick", "test_storage_offset_sub_stick_rejected"): {
-            "ops_dict": {"add": torch.add, "sub": torch.sub, "mul": torch.mul},
+        # Stick dim (the last dim, or the only dim of a 1D tensor), UNALIGNED
+        # offset: offset lands in the stick expression with a residual, which
+        # is unsupported until Step 2 (alt-layout retargeting via #2750)
+        # lands. Must cleanly fail compilation rather than silently produce
+        # wrong results.
+        (
+            "test_storage_offset_placeholder_stick_dim",
+            "test_storage_offset_placeholder_stick_dim_rejected",
+        ): {
             "param_sets": {
-                "1d_off3": (
-                    cached_randn((259,), differentiation="ss_x"),
-                    cached_randn((259,), differentiation="ss_y"),
-                    3,  # byte_offset = 6
+                "1d_offset": (
+                    lambda t: t[3:],
+                    cached_randn((259,), differentiation="ph_1d_offset"),
                 ),
-                "1d_off67": (
-                    cached_randn((323,), differentiation="ss_x"),
-                    cached_randn((323,), differentiation="ss_y"),
-                    67,  # byte_offset = 134, 67 % 64 == 3
+                "2d_last_dim_offset": (
+                    lambda t: t[:, 1:],
+                    cached_randn((5, 128), differentiation="ph_2d_last_offset"),
                 ),
-                "2d_off1_w67": (
-                    cached_randn((5, 67), differentiation="ss_x"),
-                    cached_randn((5, 67), differentiation="ss_y"),
-                    1,  # row stride = 67 fp16 → byte_offset = 134
+            },
+        },
+        # Stick dim, ALIGNED offset (exact multiple of the 64-element stick
+        # size). Unverified hypothesis: Mod(c+64, 64) simplifies to Mod(c,
+        # 64), so the stick expression's within-stick part may stay
+        # offset-free even though the absolute offset is nonzero -- unlike
+        # the unaligned cases above, which are confirmed to need Step 2.
+        # This group exists to find out empirically; not yet confirmed on
+        # hardware in either direction.
+        (
+            "test_storage_offset_placeholder_stick_dim_aligned",
+            "test_storage_offset_placeholder",
+        ): {
+            "ops_dict": {"add": lambda x: x + x, "exp": torch.exp},
+            "param_sets": {
+                "2d_aligned_stick_offset": (
+                    lambda t: t[:, 64:],
+                    cached_randn((5, 128), differentiation="ph_2d_aligned_stick"),
                 ),
             },
         },
@@ -4514,42 +4586,78 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(op, a, b)
 
-    def test_storage_offset_binary_op(self, op, x_base, y_base, offset):
-        # Slicing gives x/y a non-zero storage_offset (see #1476).
-        def fn(x, y):
-            return op(x[offset:], y[offset:])
+    def test_storage_offset_placeholder(self, op, slicer, base):
+        # Genuine placeholder case: `slicer` is applied AFTER `.to("spyre")`
+        # and BEFORE compile, so the offset/stride/gap lives on the
+        # placeholder's own FakeTensor, not on an intra-graph slice node.
+        # Tested in both modes: explicit torch.compile (compile=True), and
+        # plain eager dispatch (compile=False -- still bottoms out in a
+        # compiled kernel via register_torch_compile_kernel, but without an
+        # explicit user-level torch.compile call wrapping the whole op).
+        cpu_view = slicer(base.clone())
+        expected = op(cpu_view).float()
 
-        self.compare_with_cpu(fn, x_base, y_base, clone_inputs=True, run_eager=False)
+        dev_view = slicer(base.clone().to("spyre"))
 
-    def test_storage_offset_sub_stick_rejected(self, op, x_base, y_base, offset):
-        # A sub-stick storage_offset (byte_offset % 128 != 0) reaching
-        # on-device compute must be rejected at compile time by
-        # reject_sub_stick_offsets (see #1476), with its descriptive error,
-        # rather than failing for some unrelated downstream reason or
-        # silently producing wrong results.
-        def fn(x, y):
-            return op(x[offset:], y[offset:])
+        for mode_name, compile_mode in (("compiled", True), ("eager", False)):
+            result = _compile_and_run(op, [dev_view], "spyre", compile=compile_mode)
+            assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                f"{mode_name}: max abs diff: "
+                f"{(result.float() - expected).abs().max().item()}"
+            )
 
-        x = x_base.clone().to("spyre")
-        y = y_base.clone().to("spyre")
-
-        with pytest.raises(RuntimeError, match="is not stick-aligned"):
-            _compile_and_run(fn, [x, y], "spyre")
-
-    def test_storage_offset_sub_stick_partial_reach_rejected(self):
-        # A second view at the same sub-stick offset that only reaches the
-        # output must not exempt a sibling view that reaches on-device
-        # compute: reject_sub_stick_offsets walks per-node, not per-storage.
+    def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
+        # Genuine placeholder case where `slicer` puts the offset/stride on
+        # the stick (last) dimension. No alt-layout selection is
+        # implemented yet (depends on #2750), so this must cleanly fail in
+        # BOTH the explicit-compile and plain-eager-dispatch paths, rather
+        # than silently producing wrong results in either.
+        #
+        # Different malformed stick-expression shapes are caught by
+        # different validation points downstream (e.g. an offset-only stick
+        # expression fails alt-layout search with "no supported output
+        # layout found", while a strided one fails the stick-expression
+        # shape check with "Unexpected stick expression"), so the compiled
+        # path only asserts on the common Unsupported wrapper, not the exact
+        # message. The eager path (register_torch_compile_kernel's nested
+        # compile) raises through a different upstream Inductor error
+        # entirely (confirmed: a plain NotImplementedError, not Unsupported,
+        # for at least one case), so it's only asserted to raise at all.
         def fn(x):
-            y = x[3:]  # sub-stick offset, reaches compute below
-            z = y + y
-            out = x[3:]  # same offset, only reaches output
-            return z, out
+            return x + x
 
-        x = cached_randn((259,), differentiation="ss_partial").clone().to("spyre")
+        dev_view = slicer(base.clone().to("spyre"))
 
-        with pytest.raises(RuntimeError, match="is not stick-aligned"):
-            _compile_and_run(fn, [x], "spyre")
+        with pytest.raises(Exception, match="Unsupported"):
+            _compile_and_run(fn, [dev_view], "spyre", compile=True)
+
+        with pytest.raises(Exception):
+            _compile_and_run(fn, [dev_view], "spyre", compile=False)
+
+    def test_storage_offset_placeholder_vs_internal_equivalence(self):
+        # The same slice, once with the offset baked in BEFORE compile
+        # (placeholder case) and once constructed INSIDE the traced
+        # function (intra-graph case) -- both must produce identical
+        # results for a non-stick-dim offset.
+        def fn_placeholder(x):
+            return x + x
+
+        def fn_intragraph(x):
+            return x[1:] + x[1:]
+
+        t = cached_randn((5, 128), differentiation="ss_ph_equiv")
+        t_dev = t.to("spyre")
+        a_dev = t_dev[1:]
+
+        placeholder_result = _compile_and_run(fn_placeholder, [a_dev], "spyre")
+        intragraph_result = _compile_and_run(fn_intragraph, [t_dev], "spyre")
+
+        assert torch.allclose(
+            placeholder_result.float(), intragraph_result.float(), atol=0.1, rtol=0.1
+        ), (
+            "placeholder-origin and intra-graph-origin views diverged: "
+            f"max abs diff: {(placeholder_result.float() - intragraph_result.float()).abs().max().item()}"
+        )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):
@@ -5774,7 +5882,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(x):
             return op(dim, index, x)
 
-        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+        self.compare_with_cpu(fn, x, clone_inputs=True)
 
     def test_slice_cpu(self, op, dim, start, end, x):
         def fn(x):
@@ -5785,7 +5893,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             elif dim == 2:
                 return op(dim, x[:, :, start:end])
 
-        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
+        self.compare_with_cpu(fn, x, clone_inputs=True)
 
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):

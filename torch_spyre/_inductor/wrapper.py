@@ -154,7 +154,8 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
 
         new_stl = new.get_layout().device_layout
-        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
+        offset_increment = old.get_layout().offset or 0
+        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, {offset_increment}, {new_stl!r})"
         return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
 
     def allocate_pool(self):
