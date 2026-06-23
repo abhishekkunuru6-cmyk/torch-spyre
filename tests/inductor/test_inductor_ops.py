@@ -4224,6 +4224,78 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        # storage_offset support for graph-input placeholders, non-stick dims.
+        # `slicer` runs after .to("spyre") and before compile, so the offset
+        # lives on the placeholder itself, not an intra-graph slice.
+        ("test_storage_offset_placeholder", "test_storage_offset_placeholder"): {
+            "ops_dict": {
+                "add": lambda x: x + x,
+                "exp": torch.exp,
+                # Asymmetric operands (one fresh clean buffer, one the
+                # offset-bearing placeholder itself) -- regression coverage
+                # for the _multi_arg_pointwise_layouts fallback path, which
+                # doesn't get exercised by symmetric x+x at all.
+                "add_asymmetric": lambda x: x.clone() + x,
+            },
+            "param_sets": {
+                "2d_offset_dim0": (
+                    lambda t: t[1:, :],
+                    cached_randn((5, 128), differentiation="ph_2d_offset0"),
+                ),
+                "3d_offset_dim0": (
+                    lambda t: t[1:, :, :],
+                    cached_randn((5, 4, 128), differentiation="ph_3d_offset0"),
+                ),
+                "3d_offset_dim1": (
+                    lambda t: t[:, 1:, :],
+                    cached_randn((4, 5, 128), differentiation="ph_3d_offset1"),
+                ),
+                "3d_gap_dim1": (
+                    # offset+gap: view [9,192,32] over base [9,256,32]
+                    lambda t: t[:, 32:224, :],
+                    cached_randn((9, 256, 32), differentiation="ph_3d_gap1"),
+                ),
+            },
+        },
+        # Stick dim, unaligned offset: needs Step 2 (alt-layout, #2750).
+        # Must cleanly fail, not silently misbehave.
+        (
+            "test_storage_offset_placeholder_stick_dim",
+            "test_storage_offset_placeholder_stick_dim_rejected",
+        ): {
+            "param_sets": {
+                "1d_offset": (
+                    lambda t: t[3:],
+                    cached_randn((259,), differentiation="ph_1d_offset"),
+                ),
+                "2d_last_dim_offset": (
+                    lambda t: t[:, 1:],
+                    cached_randn((5, 128), differentiation="ph_2d_last_offset"),
+                ),
+            },
+        },
+        # Stick dim, aligned offset (multiple of 64): works without Step 2,
+        # since Mod(c+64, 64) simplifies to Mod(c, 64).
+        (
+            "test_storage_offset_placeholder_stick_dim_aligned",
+            "test_storage_offset_placeholder",
+        ): {
+            "ops_dict": {
+                "add": lambda x: x + x,
+                "exp": torch.exp,
+                # Asymmetric operands (one fresh clean buffer, one the
+                # offset-bearing placeholder itself) -- regression coverage
+                # for the _multi_arg_pointwise_layouts fallback path, which
+                # doesn't get exercised by symmetric x+x at all.
+                "add_asymmetric": lambda x: x.clone() + x,
+            },
+            "param_sets": {
+                "2d_aligned_stick_offset": (
+                    lambda t: t[:, 64:],
+                    cached_randn((5, 128), differentiation="ph_2d_aligned_stick"),
+                ),
+            },
+        },
         (
             "test_round_trip_to_dtype_implicit",
             "test_round_trip_to_dtype_implicit_cpu",
@@ -4247,79 +4319,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_fp16_4x64": (cached_randn((4, 64), dtype=torch.float16),),
                 "3d_fp16_2x4x16": (cached_randn((2, 4, 16), dtype=torch.float16),),
                 "4d_fp16_2x4x16": (cached_randn((2, 4, 16, 64), dtype=torch.float16),),
-            },
-        },
-        # storage_offset fix (#1476), scoped to graph-input placeholders only
-        # (yoheiueda review: focus on non-stick-dim offsets/gaps on graph
-        # inputs first; intra-graph slices are PR #2595's territory and are
-        # untouched here). Each `slicer` is applied to the tensor AFTER
-        # `.to("spyre")` and BEFORE compile, so the offset/stride/gap lives
-        # on the placeholder's own FakeTensor, not on an intra-graph slice
-        # node.
-        #
-        # Non-stick dims (any dim except the last): expected to produce
-        # correct results via the existing index-expression/coordinate
-        # machinery, with no special-case handling.
-        ("test_storage_offset_placeholder", "test_storage_offset_placeholder"): {
-            "ops_dict": {"add": lambda x: x + x, "exp": torch.exp},
-            "param_sets": {
-                "2d_offset_dim0": (
-                    lambda t: t[1:, :],
-                    cached_randn((5, 128), differentiation="ph_2d_offset0"),
-                ),
-                "3d_offset_dim0": (
-                    lambda t: t[1:, :, :],
-                    cached_randn((5, 4, 128), differentiation="ph_3d_offset0"),
-                ),
-                "3d_offset_dim1": (
-                    lambda t: t[:, 1:, :],
-                    cached_randn((4, 5, 128), differentiation="ph_3d_offset1"),
-                ),
-                "3d_gap_dim1": (
-                    # offset (32 rows) + gap (32 unused trailing rows):
-                    # view.shape=[9,192,32] over base.shape=[9,256,32]
-                    lambda t: t[:, 32:224, :],
-                    cached_randn((9, 256, 32), differentiation="ph_3d_gap1"),
-                ),
-            },
-        },
-        # Stick dim (the last dim, or the only dim of a 1D tensor), UNALIGNED
-        # offset: offset lands in the stick expression with a residual, which
-        # is unsupported until Step 2 (alt-layout retargeting via #2750)
-        # lands. Must cleanly fail compilation rather than silently produce
-        # wrong results.
-        (
-            "test_storage_offset_placeholder_stick_dim",
-            "test_storage_offset_placeholder_stick_dim_rejected",
-        ): {
-            "param_sets": {
-                "1d_offset": (
-                    lambda t: t[3:],
-                    cached_randn((259,), differentiation="ph_1d_offset"),
-                ),
-                "2d_last_dim_offset": (
-                    lambda t: t[:, 1:],
-                    cached_randn((5, 128), differentiation="ph_2d_last_offset"),
-                ),
-            },
-        },
-        # Stick dim, ALIGNED offset (exact multiple of the 64-element stick
-        # size). Unverified hypothesis: Mod(c+64, 64) simplifies to Mod(c,
-        # 64), so the stick expression's within-stick part may stay
-        # offset-free even though the absolute offset is nonzero -- unlike
-        # the unaligned cases above, which are confirmed to need Step 2.
-        # This group exists to find out empirically; not yet confirmed on
-        # hardware in either direction.
-        (
-            "test_storage_offset_placeholder_stick_dim_aligned",
-            "test_storage_offset_placeholder",
-        ): {
-            "ops_dict": {"add": lambda x: x + x, "exp": torch.exp},
-            "param_sets": {
-                "2d_aligned_stick_offset": (
-                    lambda t: t[:, 64:],
-                    cached_randn((5, 128), differentiation="ph_2d_aligned_stick"),
-                ),
             },
         },
         ("test_conv2d", "test_conv2d_cpu"): {

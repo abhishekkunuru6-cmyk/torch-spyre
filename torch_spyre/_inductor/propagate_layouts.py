@@ -634,6 +634,26 @@ def _multi_arg_pointwise_layouts(
             projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+            arg_offset = concretize_expr(arg.layout.offset)
+            if arg_offset:
+                # arg.layout.size is the view's own logical extent, which
+                # alone gives SpyreTensorLayout no room to place a nonzero
+                # offset (e.g. a view exactly one stick wide has device
+                # size 1 there, leaving nowhere for the offset to resolve
+                # except directly onto the stick coordinate, which then
+                # fails the offset-free check below). Inflate each dim's
+                # size by however many of its own stride the offset
+                # accounts for (largest stride first), so this freshly
+                # built layout has the same room the real underlying
+                # storage already has.
+                remaining = arg_offset
+                for d in sorted(range(len(c_in_stride)), key=lambda d: -c_in_stride[d]):
+                    if c_in_stride[d] <= 0:
+                        continue
+                    extra = remaining // c_in_stride[d]
+                    if extra:
+                        c_in_size[d] += extra
+                        remaining -= extra * c_in_stride[d]
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order
             )
