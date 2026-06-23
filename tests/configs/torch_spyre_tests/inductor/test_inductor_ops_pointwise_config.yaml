@@ -6,7 +6,7 @@ test_suite_config:
         - names:
             # Covers pointwise ops plus PR 2180 eq-scalar tests, including
             # parameterized variants, shared base helpers, and standalone cases.
-            - TestOps::test_(pointwise|sqrt|rsqrt|log_|alias_operands|cmp|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int).*
+            - TestOps::test_(pointwise|sqrt|rsqrt|log_|alias_operands|cmp_(eq|ne|ge|le|gt|lt|scalar_int64)|logical_not|bool|eq_scalar|scalar_(comparison|multidim|vs_tensor)_base|scalar_comparison_simple1|eq_scalar_constant_int).*
           mode: mandatory_success
           tags:
             - ops__inductor-pointwise
@@ -22,6 +22,12 @@ test_suite_config:
             - TestOps::test_eq_scalar_constant_zero
             - TestOps::test_eq_scalar_multidim
             - TestOps::test_eq_scalar_vs_tensor_comparison
+            # Standalone fp32 comparison stores bool to HBM. Layout propagation must
+            # assign IEEE_FP32 (32 elems/stick) to match fp32 input element size, but
+            # hardware writes SEN169_FP16 (64 elems/stick), causing ~53% element
+            # mismatch when reading back. Fused cases (e.g. test_bool_fp32_src_to_*)
+            # are unaffected because the intermediate bool never touches HBM.
+            - TestOps::test_cmp_fp32.*
           mode: xfail
           tags:
             - ops__inductor-pointwise

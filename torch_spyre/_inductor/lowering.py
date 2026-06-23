@@ -1076,10 +1076,19 @@ def to_dtype(x, dst_dtype):
         return clone(x)
 
     # Check if conversion is supported by backend
-    if DtypeOpTable.get_operator(src_dtype, dst_dtype) is None:
+    if not DtypeOpTable.is_supported(src_dtype, dst_dtype):
         # Unsupported conversion - fall back to CPU
         op = torch.ops.spyre.to_dtype_cpu.default
         return eager_fallback(op, x, dst_dtype)
+
+    # DL16TOFP32_OP reads SEN169_FP16 data written by a computation kernel.
+    # DMA-copied bool InputBuffers have a different HBM element ordering that
+    # produces wrong results (28/64 elements shuffled). Fall back to CPU for
+    # host-created bool → float32; on-device computed bools use the native path.
+    if src_dtype == torch.bool and dst_dtype == torch.float32:
+        if isinstance(_peel(x), ir.InputBuffer):
+            op = torch.ops.spyre.to_dtype_cpu.default
+            return eager_fallback(op, x, dst_dtype)
 
     return lowering.to_dtype(x, dst_dtype, copy=True)
 

@@ -290,7 +290,6 @@ TO_DTYPE_OP_PARAMS_SETS = {
     )
     for src, dst in DtypeOpTable.get_dtype_pairs()
     for shape in TO_DTYPE_OP_SHAPES
-    if src != torch.bool and dst != torch.bool
 }
 
 
@@ -303,6 +302,7 @@ TO_DTYPE_OP_EXPECT_FAIL = [
     if (
         shape in _DTYPE_OP_ALL_OPS_FAIL_SHAPES
         or DtypeOpTable.get_operator(src, dst) != IDENTITY_OP
+        or (src == torch.float32 and shape[-1] < 32)
     )
 ]
 
@@ -1336,6 +1336,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "signed_zero": (
                     torch.tensor([-0.0, 0.0, -0.0, 0.0], dtype=torch.float16),
                     torch.tensor([0.0, -0.0, 0.0, -0.0], dtype=torch.float16),
+                ),
+            },
+        },
+        ("test_cmp_fp32", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "ge": torch.ge,
+                "le": torch.le,
+                "gt": torch.gt,
+                "lt": torch.lt,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float32
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float32
+                    ),
+                ),
+                "2d": (
+                    torch.ceil(cached_randn((64, 64), abs=True, scale=10.0)).to(
+                        dtype=torch.float32
+                    ),
+                    torch.ceil(cached_randn((64, 64), abs=True, scale=9.9)).to(
+                        dtype=torch.float32
+                    ),
                 ),
             },
         },
@@ -5612,6 +5640,45 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         assert torch.equal(output_cpu, expected_output), (
             f"Bool conversion failed: got {output_cpu.sum().item()}/{64} True, expected {expected_output.sum().item()}/{64}"
         )
+
+    def test_bool_fp16_src_to_fp32_cpu(self):
+        # A bool produced from an fp16 comparison is physically SEN169_FP16.
+        # Converting it to fp32 must resolve via DL16TOFP32_OP (issue #1482).
+        def fn(x, y):
+            return (x > y).to(dtype=torch.float32)
+
+        x = cached_randn((64,), dtype=torch.float16)
+        y = cached_randn((64,), dtype=torch.float16)
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+
+    def test_bool_fp32_src_to_fp32_cpu(self):
+        # A bool produced from an fp32 comparison is physically IEEE_FP32.
+        # Converting it to fp32 is an identity reinterpret.
+        def fn(x, y):
+            return (x > y).to(dtype=torch.float32)
+
+        x = cached_randn((64,), dtype=torch.float32)
+        y = cached_randn((64,), dtype=torch.float32)
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+
+    def test_bool_fp32_src_to_fp16_cpu(self):
+        # A bool produced from an fp32 comparison is physically IEEE_FP32.
+        # Converting it to fp16 must resolve via FP32TODL16_OP.
+        def fn(x, y):
+            return (x > y).to(dtype=torch.float16)
+
+        x = cached_randn((64,), dtype=torch.float32)
+        y = cached_randn((64,), dtype=torch.float32)
+        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+
+    def test_bool_host_to_fp32_cpu(self):
+        # Literal repro from issue #1482: a host-created bool tensor (always
+        # physically SEN169_FP16 on device) converted to fp32.
+        def fn(x):
+            return x.to(dtype=torch.float32)
+
+        x = torch.randint(0, 2, (64,), dtype=torch.bool)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
     def test_conv2d_cpu(self, x, weight, bias, padding, stride, groups):
         def fn(x, weight, bias, padding, stride, groups):

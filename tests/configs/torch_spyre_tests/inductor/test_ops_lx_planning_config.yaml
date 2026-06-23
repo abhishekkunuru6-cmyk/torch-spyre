@@ -13,7 +13,17 @@ test_suite_config:
       # than enumerating each LxPlanningTwoOpPointwiseAdditionTest:: and
       # LxPlanningTwoOpReductionTest:: test name explicitly.
       unlisted_test_mode: mandatory_success
-      # tests:
+      tests:
+        - names:
+            # Standalone fp32 comparison stores bool to HBM. Layout propagation
+            # assigns IEEE_FP32 (32 elems/stick) to match fp32 input element
+            # size, but the hardware comparison op writes SEN169_FP16 (64
+            # elems/stick), causing ~53% element mismatch when reading back.
+            - LxPlanningTwoOpPointwiseAdditionTest.*::test_cmp_fp32.*
+            - LxPlanningTwoOpReductionTest.*::test_cmp_fp32.*
+          mode: xfail
+          tags:
+            - ops__inductor-lx-planning
       #     ##########################################################################################
       #     # The following tests are failing in the CICD currently -- hence moving these to xfail now
       #     # Commented tests are passing now as per latest main (was failing previously in the CI)
