@@ -22,11 +22,11 @@ test_suite_config:
             - TestOps::test_eq_scalar_constant_zero
             - TestOps::test_eq_scalar_multidim
             - TestOps::test_eq_scalar_vs_tensor_comparison
-            # Standalone fp32 comparison stores bool to HBM. Layout propagation must
-            # assign IEEE_FP32 (32 elems/stick) to match fp32 input element size, but
-            # hardware writes SEN169_FP16 (64 elems/stick), causing ~53% element
-            # mismatch when reading back. Fused cases (e.g. test_bool_fp32_src_to_*)
-            # are unaffected because the intermediate bool never touches HBM.
+            # Standalone fp32 comparisons can't correctly read their bool result back
+            # from device memory -- the read-back only supports the fp16 data format,
+            # but fp32 results need a different one. Fused cases (e.g.
+            # test_bool_fp32_src_to_*) are unaffected, since the result never leaves
+            # the device.
             - TestOps::test_cmp_fp32.*
           mode: xfail
           tags:

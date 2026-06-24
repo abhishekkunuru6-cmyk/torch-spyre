@@ -46,18 +46,6 @@ def bool_equivalent_dtype(device_dtype: DataFormats) -> Optional[torch.dtype]:
 
 class DtypeOpTable:
     _IDENTITY_DTYPES = [
-        # bool -> X is resolved dynamically via get_bool_src_operator
-        # (bool may be SEN169_FP16 or IEEE_FP32 depending on the op that
-        # produced it).
-        #
-        # fp16/bf16 -> bool: safe as IDENTITY_OP because fp16 and bf16 are
-        # SEN169_FP16 (64 elems/stick), the same format as bool produced by
-        # fp16 comparisons, so no restickification is needed.
-        #
-        # float32 -> bool: float32 is IEEE_FP32 (32 elems/stick). The output
-        # bool inherits IEEE_FP32 format (propagate_layouts._single_arg_op_layout
-        # skips the size-change branch for bool outputs), so IDENTITY_OP applies
-        # with no restickification needed.
         (torch.float16, torch.bfloat16),
         (torch.bfloat16, torch.float16),
         (torch.float16, torch.bool),

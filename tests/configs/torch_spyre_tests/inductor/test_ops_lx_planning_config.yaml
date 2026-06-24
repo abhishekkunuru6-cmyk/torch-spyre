@@ -15,10 +15,9 @@ test_suite_config:
       unlisted_test_mode: mandatory_success
       tests:
         - names:
-            # Standalone fp32 comparison stores bool to HBM. Layout propagation
-            # assigns IEEE_FP32 (32 elems/stick) to match fp32 input element
-            # size, but the hardware comparison op writes SEN169_FP16 (64
-            # elems/stick), causing ~53% element mismatch when reading back.
+            # Standalone fp32 comparisons can't correctly read their bool result back
+            # from device memory -- the read-back only supports the fp16 data format,
+            # but fp32 results need a different one. 
             - LxPlanningTwoOpPointwiseAdditionTest.*::test_cmp_fp32.*
             - LxPlanningTwoOpReductionTest.*::test_cmp_fp32.*
           mode: xfail

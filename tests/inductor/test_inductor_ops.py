@@ -261,6 +261,8 @@ TO_DTYPE_OP_SHAPES_UNALIGNED = [
     (68,),  # 1D unaligned: 68 > 1 fp16 stick (64 elems), not a multiple of 64
     (4, 16),
     (4, 68),
+    (4, 32),  # exactly 1 fp32 stick -- shape[-1] < 32 check should NOT apply here
+    (4, 63),  # just under 1 fp16 stick, but > 1 fp32 stick (not a multiple of 32)
 ]
 
 TO_DTYPE_OP_SHAPES_ALIGNED = [
@@ -5653,13 +5655,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_bool_fp32_src_to_fp32_cpu(self):
         # A bool produced from an fp32 comparison is physically IEEE_FP32.
-        # Converting it to fp32 is an identity reinterpret.
+        # Converting it to fp32 is an identity reinterpret. Asserting on the
+        # op_spec debug log (not just numeric correctness) confirms Spyre
+        # actually emits IDENTITY_OP for this conversion, rather than e.g.
+        # silently falling back to CPU and happening to match.
         def fn(x, y):
             return (x > y).to(dtype=torch.float32)
 
         x = cached_randn((64,), dtype=torch.float32)
         y = cached_randn((64,), dtype=torch.float32)
-        self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+        with self.assertLogs("spyre.inductor.spyre_kernel", level="DEBUG") as logs:
+            self.compare_with_cpu(fn, x, y, cpu_compile=False, run_eager=False)
+        self.assertTrue(
+            any("op_spec: identity," in message for message in logs.output),
+            f"Expected an identity op_spec, got: {logs.output}",
+        )
 
     def test_bool_fp32_src_to_fp16_cpu(self):
         # A bool produced from an fp32 comparison is physically IEEE_FP32.
@@ -5676,6 +5686,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # physically SEN169_FP16 on device) converted to fp32.
         def fn(x):
             return x.to(dtype=torch.float32)
+
+        x = torch.randint(0, 2, (64,), dtype=torch.bool)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
+    def test_bool_host_to_fp16_cpu(self):
+        # Host-created bool tensors are DMA-copied (always physically
+        # SEN169_FP16 on device, same as test_bool_host_to_fp32_cpu above).
+        # Unlike the fp32 case, converting to float16 resolves via
+        # IDENTITY_OP -- a pure byte copy, no value computation -- so there's
+        # no output-ordering convention for a DMA copy to mismatch against.
+        def fn(x):
+            return x.to(dtype=torch.float16)
 
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
