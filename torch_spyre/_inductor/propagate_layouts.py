@@ -654,6 +654,13 @@ def _multi_arg_pointwise_layouts(
                     if extra:
                         c_in_size[d] += extra
                         remaining -= extra * c_in_stride[d]
+                if remaining:
+                    # Offset didn't fully decompose against this arg's
+                    # strides (only guaranteed when some dim's stride is
+                    # exactly 1) -- the inflated size doesn't actually
+                    # reflect the real underlying storage, so don't risk
+                    # computing offset-freeness against it.
+                    return False
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order
             )

@@ -4658,6 +4658,28 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             f"max abs diff: {(placeholder_result.float() - intragraph_result.float()).abs().max().item()}"
         )
 
+    def test_storage_offset_placeholder_buffer_reuse(self):
+        # Regression test: make_buffer_reuse must propagate the offset
+        # *delta* between reused buffers, not the old buffer's raw offset
+        # (which double-counts it). `y = x + x` then `y.sum(dim=0)` forces a
+        # differently-shaped buffer to reuse y's offset-carrying allocation
+        # via the reinterpret_tensor_with_layout path.
+        def fn(x):
+            y = x + x
+            return y.sum(dim=0, keepdim=False)
+
+        base = cached_randn((5, 128), differentiation="ph_reuse_offset")
+        dev_view = base.clone().to("spyre")[1:, :]
+        cpu_view = base.clone()[1:, :]
+        expected = fn(cpu_view).float()
+
+        for mode_name, compile_mode in (("compiled", True), ("eager", False)):
+            result = _compile_and_run(fn, [dev_view], "spyre", compile=compile_mode)
+            assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                f"{mode_name}: max abs diff: "
+                f"{(result.float() - expected).abs().max().item()}"
+            )
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_fallback_binary_op_cpu(self, op, x, y):
         self.compare_with_cpu(op, x, y, run_eager=False)
