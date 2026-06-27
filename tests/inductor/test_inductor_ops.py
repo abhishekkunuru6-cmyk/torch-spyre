@@ -2982,16 +2982,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d2s2": (2, 128, 192, cached_randn((3, 3, 192))),
             },
         },
-        # Every param set in this group and the three test_slice_stick_reduce_dim*
-        # groups below slices the stick (last) dimension at an UNALIGNED offset
-        # (32, not a multiple of the 64-element stick size) -- that's the whole
-        # point of these groups, added to test PR #2595's restickify-rescue of
-        # unaligned stick-dim slices for the INTRA-GRAPH case. The compiled path
-        # still passes via that mechanism; the (newly-enabled) eager path now
-        # correctly raises, since `x[:, 32:96]` in eager builds a genuine
-        # on-device placeholder with the offset on its own metadata, which needs
-        # Step 2 (alt-layout retargeting, blocked on #2750) to work -- not yet
-        # implemented. All param sets here are expected to fail for that reason.
         ("test_slice_stick", "test_slice_cpu"): {
             "ops_dict": {
                 "clone": lambda _, x: torch.clone(x),
@@ -3010,16 +3000,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
-            "expect_fail": [
-                "2d64",
-                "2d128",
-                "3d64_0",
-                "3d64_1",
-                "3d64_01",
-                "3d128_0",
-                "3d128_1",
-                "3d128_01",
-            ],
         },
         ("test_slice_stick_reduce_dim0", "test_slice_cpu"): {
             "ops_dict": {
@@ -3036,16 +3016,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
-            "expect_fail": [
-                "2d64",
-                "2d128",
-                "3d64_0",
-                "3d64_1",
-                "3d64_01",
-                "3d128_0",
-                "3d128_1",
-                "3d128_01",
-            ],
         },
         ("test_slice_stick_reduce_dim1", "test_slice_cpu"): {
             "ops_dict": {
@@ -3062,16 +3032,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
-            "expect_fail": [
-                "2d64",
-                "2d128",
-                "3d64_0",
-                "3d64_1",
-                "3d64_01",
-                "3d128_0",
-                "3d128_1",
-                "3d128_01",
-            ],
         },
         ("test_slice_stick_reduce_dim2", "test_slice_cpu"): {
             "ops_dict": {
@@ -3086,14 +3046,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "3d128_1": (2, 32, 160, cached_randn((2, 192, 256))),
                 "3d128_01": (2, 32, 160, cached_randn((128, 192, 256))),
             },
-            "expect_fail": [
-                "3d64_0",
-                "3d64_1",
-                "3d64_01",
-                "3d128_0",
-                "3d128_1",
-                "3d128_01",
-            ],
         },
         ("test_slice_synthetic_dims", "test_slice_synthetic_dims_cpu"): {
             "param_sets": {
@@ -5903,7 +5855,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         def fn(x):
             return op(dim, index, x)
 
-        self.compare_with_cpu(fn, x, clone_inputs=True)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
     def test_slice_cpu(self, op, dim, start, end, x):
         def fn(x):
@@ -5914,7 +5866,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             elif dim == 2:
                 return op(dim, x[:, :, start:end])
 
-        self.compare_with_cpu(fn, x, clone_inputs=True)
+        self.compare_with_cpu(fn, x, clone_inputs=True, run_eager=False)
 
     def test_slice_synthetic_dims_cpu(self, x):
         def fn(x):

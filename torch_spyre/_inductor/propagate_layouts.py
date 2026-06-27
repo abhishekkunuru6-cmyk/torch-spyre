@@ -634,33 +634,6 @@ def _multi_arg_pointwise_layouts(
             projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
             c_in_size = [concretize_expr(s) for s in arg.layout.size]
             c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
-            arg_offset = concretize_expr(arg.layout.offset)
-            if arg_offset:
-                # arg.layout.size is the view's own logical extent, which
-                # alone gives SpyreTensorLayout no room to place a nonzero
-                # offset (e.g. a view exactly one stick wide has device
-                # size 1 there, leaving nowhere for the offset to resolve
-                # except directly onto the stick coordinate, which then
-                # fails the offset-free check below). Inflate each dim's
-                # size by however many of its own stride the offset
-                # accounts for (largest stride first), so this freshly
-                # built layout has the same room the real underlying
-                # storage already has.
-                remaining = arg_offset
-                for d in sorted(range(len(c_in_stride)), key=lambda d: -c_in_stride[d]):
-                    if c_in_stride[d] <= 0:
-                        continue
-                    extra = remaining // c_in_stride[d]
-                    if extra:
-                        c_in_size[d] += extra
-                        remaining -= extra * c_in_stride[d]
-                if remaining:
-                    # Offset didn't fully decompose against this arg's
-                    # strides (only guaranteed when some dim's stride is
-                    # exactly 1) -- the inflated size doesn't actually
-                    # reflect the real underlying storage, so don't risk
-                    # computing offset-freeness against it.
-                    return False
             in_stl = SpyreTensorLayout(
                 c_in_size, c_in_stride, output.dtype, projected_dim_order
             )
@@ -1009,18 +982,49 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         operations.remove(op)
 
 
-def _contiguous_strides_for(size: tuple[int, ...]) -> tuple[int, ...]:
-    stride = [1] * len(size)
-    for i in range(len(size) - 2, -1, -1):
-        stride[i] = stride[i + 1] * size[i + 1]
-    return tuple(stride)
+def _eager_view_input_layout(
+    real_input: torch.Tensor,
+    ptl: FixedLayout,
+    name: str,
+) -> "FixedLayout | None":
+    # Placeholder views arrive with view geometry on their FixedLayout, but
+    # downstream passes expect base-storage size/stride with the offset in
+    # layout.offset (matching the inline aten.slice convention). Rewrite if
+    # the input is a sub-region (strides match base, sizes differ) or has a
+    # non-zero storage_offset. Raises Unsupported for stick-dim-unaligned
+    # offsets; aligned offsets work because Mod(c+k*64, 64) == Mod(c, 64).
+    base = real_input._base
+    storage_offset = real_input.storage_offset()
+    is_sub_region = (
+        base is not None
+        and tuple(real_input.stride()) == tuple(base.stride())
+        and tuple(real_input.size()) != tuple(base.size())
+    )
+    if not (is_sub_region or storage_offset != 0):
+        return None
 
+    elem_in_stick = get_elem_in_stick(ptl.dtype)
+    if storage_offset % elem_in_stick != 0:
+        raise Unsupported(
+            f"graph input {name} has stick-dim unaligned "
+            f"storage_offset={storage_offset} (not a multiple of "
+            f"{elem_in_stick}); not yet supported"
+        )
 
-def _logical_numel(size: tuple[int, ...]) -> int:
-    numel = 1
-    for s in size:
-        numel *= s
-    return numel
+    if is_sub_region:
+        new_size = list(base.size())
+        new_stride = list(base.stride())
+    else:
+        new_size = list(real_input.size())
+        new_stride = list(real_input.stride())
+
+    return FixedLayout(
+        device=ptl.device,
+        dtype=ptl.dtype,
+        size=new_size,
+        stride=new_stride,
+        offset=sympy.Integer(storage_offset),
+    )
 
 
 def propagate_spyre_tensor_layouts(
@@ -1050,25 +1054,9 @@ def propagate_spyre_tensor_layouts(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                storage_offset = real_input.storage_offset()
-                view_stride = tuple(real_input.stride())
-                view_size = tuple(real_input.size())
-                base_numel = (
-                    real_input.untyped_storage().nbytes() // real_input.element_size()
-                )
-                is_view = (
-                    storage_offset != 0
-                    or view_stride != _contiguous_strides_for(view_size)
-                    or _logical_numel(view_size) != base_numel
-                )
-                if is_view:
-                    tb.data.data.layout = FixedLayout(
-                        device=ptl.device,
-                        dtype=ptl.dtype,
-                        size=list(view_size),
-                        stride=list(view_stride),
-                        offset=sympy.Integer(storage_offset),
-                    )
+                new_layout = _eager_view_input_layout(real_input, ptl, name)
+                if new_layout is not None:
+                    tb.data.data.layout = new_layout
                 tb.layouts = [stl]
 
     # Operations are in topological order (guaranteed by GraphLowering).
