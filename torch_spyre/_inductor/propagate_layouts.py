@@ -987,14 +987,31 @@ def _eager_view_input_layout(
     ptl: FixedLayout,
     name: str,
 ) -> "FixedLayout | None":
-    # Placeholder views arrive with view geometry on their FixedLayout, but
-    # downstream passes expect base-storage size/stride with the offset in
-    # layout.offset (matching the inline aten.slice convention). Rewrite if
-    # the input is a sub-region (strides match base, sizes differ) or has a
-    # non-zero storage_offset. Raises Unsupported for stick-dim-unaligned
-    # offsets; aligned offsets work because Mod(c+k*64, 64) == Mod(c, 64).
+    """Rewrite a placeholder view's FixedLayout to "layout = base, dep = view".
+
+    Eager-mode placeholders arrive with view size/stride/offset baked onto
+    FixedLayout. Downstream passes (and inline-slice paths) instead expect
+    base-storage size/stride with the offset in ``layout.offset`` so
+    ``FixedLayout.make_indexer`` weaves it into ``MemoryDep.index``.
+
+    Returns the replacement layout, or ``None`` if no rewrite is needed.
+    """
     base = real_input._base
     storage_offset = real_input.storage_offset()
+
+    # The two gates below are intentionally orthogonal:
+    #
+    #   Example       | sub-region | offset | Action
+    #   --------------|------------|--------|-------------------------------
+    #   x[1:]         | y          | y      | size/stride <- base; offset
+    #   x[:6]         | y          | n      | size/stride <- base
+    #   x[1:].t()     | n          | y      | keep view size/stride; offset
+    #   x.t()         | n          | n      | no rewrite
+    #
+    # Sub-region requires stride preserved AND size differs. A pure
+    # transpose differs on both, but rewriting it to base size/stride
+    # would silently strip the permutation -- it falls to the offset-only
+    # branch instead.
     is_sub_region = (
         base is not None
         and tuple(real_input.stride()) == tuple(base.stride())
@@ -1004,6 +1021,8 @@ def _eager_view_input_layout(
         return None
 
     elem_in_stick = get_elem_in_stick(ptl.dtype)
+    # TODO: unaligned stick-dim offsets need alt-layout retargeting;
+    # currently rejected to avoid silent miscompute downstream.
     if storage_offset % elem_in_stick != 0:
         raise Unsupported(
             f"graph input {name} has stick-dim unaligned "
@@ -1012,9 +1031,11 @@ def _eager_view_input_layout(
         )
 
     if is_sub_region:
+        # Offset (via make_indexer) + dep.ranges recover the view extent.
         new_size = list(base.size())
         new_stride = list(base.stride())
     else:
+        # Keep the view's permuted size/stride, just attach the offset.
         new_size = list(real_input.size())
         new_stride = list(real_input.stride())
 
