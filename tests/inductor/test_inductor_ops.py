@@ -4538,13 +4538,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         self.compare_with_cpu(op, a, b)
 
     def test_storage_offset_placeholder(self, op, slicer, base):
-        # Genuine placeholder case: `slicer` is applied AFTER `.to("spyre")`
-        # and BEFORE compile, so the offset/stride/gap lives on the
-        # placeholder's own FakeTensor, not on an intra-graph slice node.
-        # Tested in both modes: explicit torch.compile (compile=True), and
-        # plain eager dispatch (compile=False -- still bottoms out in a
-        # compiled kernel via register_torch_compile_kernel, but without an
-        # explicit user-level torch.compile call wrapping the whole op).
+        # slicer runs after .to("spyre") and before compile, so the
+        # offset lives on the placeholder's FakeTensor, not an intra-graph
+        # slice node. Verified in both compiled and eager modes.
         cpu_view = slicer(base.clone())
         expected = op(cpu_view).float()
 
@@ -4558,22 +4554,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             )
 
     def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
-        # Genuine placeholder case where `slicer` puts the offset/stride on
-        # the stick (last) dimension. No alt-layout selection is
-        # implemented yet (depends on #2750), so this must cleanly fail in
-        # BOTH the explicit-compile and plain-eager-dispatch paths, rather
-        # than silently producing wrong results in either.
-        #
-        # Different malformed stick-expression shapes are caught by
-        # different validation points downstream (e.g. an offset-only stick
-        # expression fails alt-layout search with "no supported output
-        # layout found", while a strided one fails the stick-expression
-        # shape check with "Unexpected stick expression"), so the compiled
-        # path only asserts on the common Unsupported wrapper, not the exact
-        # message. The eager path (register_torch_compile_kernel's nested
-        # compile) raises through a different upstream Inductor error
-        # entirely (confirmed: a plain NotImplementedError, not Unsupported,
-        # for at least one case), so it's only asserted to raise at all.
+        # Stick-dim placeholder offset: alt-layout retargeting not yet
+        # implemented (#2750), so both paths must raise rather than
+        # silently miscompute. Compiled raises Unsupported; eager raises
+        # a different upstream error, so only Exception is asserted there.
         def fn(x):
             return x + x
 
