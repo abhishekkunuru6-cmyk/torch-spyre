@@ -118,8 +118,6 @@ def _preserve_shared_weight_unit_bmm_dim(
             insert_at = len(arg.device_size) - 1
             arg.device_size.insert(insert_at, 1)
             arg.device_coordinates.insert(insert_at, sympy.S.Zero)
-            if arg.stride_map is not None:
-                arg.stride_map.insert(insert_at, -1)
         unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
 
     if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
@@ -136,8 +134,6 @@ def _preserve_shared_weight_unit_bmm_dim(
         order.append(len(arg.device_size) - 1)
         arg.device_size[:] = [arg.device_size[i] for i in order]
         arg.device_coordinates[:] = [arg.device_coordinates[i] for i in order]
-        if arg.stride_map is not None and len(arg.stride_map) == len(order):
-            arg.stride_map[:] = [arg.stride_map[i] for i in order]
 
     logger.info("Preserving shared-weight unit BMM dim %s", unit_sym)
     return {unit_sym: (sympy.S.One, 1), **it_space}
@@ -454,6 +450,7 @@ class SpyreKernelOpsHandler(DefaultHandler):
             sym = sympy_index_symbol(f"indirect{self.kernel._indirect_var_count}")
             self.kernel._indirect_var_count += 1
             self.kernel.indirect_vars[sym] = index_var
+            self.kernel.indirect_sizes[sym] = int(size)
             return sym
         return sympy_index_symbol(str(index_var))
 
@@ -477,7 +474,13 @@ class SpyreKernel(Kernel[CSEVariable]):
         self.op_specs: list[OpSpec | UnimplementedOp | LoopSpec] = []
         self.spyre_kernel_args: list[Tuple[str, TensorArg]] = []
         self.indirect_vars: dict[sympy.Symbol, TensorAccess] = {}
+        self.indirect_sizes: dict[sympy.Symbol, int] = {}
         self._indirect_var_count: int = 0
+
+    def indirect_var_names(self) -> "frozenset[str] | None":
+        if not self.indirect_vars:
+            return None
+        return frozenset(t.name for t in self.indirect_vars.values())
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -499,17 +502,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         # can correctly isolate each loop variable's contribution.
 
         index = concretize_index(tensor.index, set(it_space.keys()))
-        indirect_load_subs = (
-            indirect_access_subs_from_kernel(self.indirect_vars)
-            if self.indirect_vars
-            else None
-        )
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
             it_space,
             index,
-            indirect_load_subs,
+            self.indirect_sizes,
         )
         tensor_arg = TensorArg(
             is_input,
@@ -518,7 +516,6 @@ class SpyreKernel(Kernel[CSEVariable]):
             tensor.layout.device_layout.device_size,
             device_coords,
             tensor.layout.allocation,
-            stride_map=list(tensor.layout.device_layout.stride_map),
             per_tile_fixed=getattr(tensor.layout, "per_tile_fixed", False),
             name=opspec_name,
         )
@@ -535,11 +532,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         is_reduction: bool,
         args: Sequence[TensorArg],
         op_info: dict[str, Any],
+        indirect_var_names: "frozenset[str] | None" = None,
     ) -> OpSpec:
         from torch_spyre._inductor.constants import SPYRE_FP8_OPS
 
         for arg in args:
-            if _is_indirect_index_arg(arg, args):
+            if _is_indirect_index_arg(arg, indirect_var_names):
                 continue
             # Check if operation supports the argument's dtype
             if not (
@@ -701,12 +699,16 @@ class SpyreKernel(Kernel[CSEVariable]):
                     raise Unsupported(f"unexpected argument {input} to {value.op}")
             args.append(self.create_tensor_arg(False, real_dst_name, dst))
             op_info.update(value.op_info)
-            self.op_specs.append(self.create_op_spec(value.op, False, args, op_info))
+            self.op_specs.append(
+                self.create_op_spec(
+                    value.op, False, args, op_info, self.indirect_var_names()
+                )
+            )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
             if self.indirect_vars:
-                # Gather/scatter: create_tensor_arg applies indirect_access_subs automatically
-                # (via compute_coordinates) so all args come out with correct coordinates.
+                # Gather/scatter: coordinates are built with raw indirect symbols here;
+                # indirect_access_subs is applied later in codegen_kernel → simplify_op_spec.
                 # TODO: scatter codegen (IndirectAccess on output TensorArg → SuperDSC) not yet wired up.
                 args = [
                     self.create_tensor_arg(
@@ -738,7 +740,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                 op = RESTICKIFY_OP
             else:
                 op = IDENTITY_OP
-            op_spec = self.create_op_spec(op, False, args, op_info)
+            op_spec = self.create_op_spec(
+                op, False, args, op_info, self.indirect_var_names()
+            )
             self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
@@ -820,8 +824,13 @@ class SpyreKernel(Kernel[CSEVariable]):
     def codegen_kernel(self):
         """Codegen the body of this kernel by pretty printing its list of OpSpecs"""
 
+        indirect_access_subs = (
+            indirect_access_subs_from_kernel(self.indirect_vars)
+            if self.indirect_vars
+            else None
+        )
         for op_spec in _iter_op_specs(self.op_specs):
-            simplify_op_spec(op_spec)
+            simplify_op_spec(op_spec, self.indirect_sizes, indirect_access_subs)
 
         def sympy_str(x: sympy.Expr) -> str:
             if isinstance(x, IndirectAccess):
@@ -877,20 +886,17 @@ def _indirect_syms_used(
     }
 
 
-def _is_indirect_index_arg(arg: TensorArg, args: Sequence[TensorArg]) -> bool:
-    """Return True if arg is an indirect index tensor in this op spec.
+def _is_indirect_index_arg(
+    arg: TensorArg, indirect_var_names: "frozenset[str] | None"
+) -> bool:
+    """Return True if arg is an indirect index tensor (i.e. a gather index buffer).
 
-    An arg is an indirect index tensor if it has a name and that name appears
-    as the argument of an IndirectAccess in another arg's device_coordinates.
+    Uses the kernel-level indirect_var_names set, which is populated before
+    create_op_spec is called and is always ground truth regardless of whether
+    IndirectAccess substitution has run.
     """
-    if arg.name is None:
-        return False
-    return any(
-        arg.name == sym.name
-        for a in args
-        for coord in a.device_coordinates
-        for il in coord.atoms(IndirectAccess)
-        for sym in il.args
+    return arg.name is not None and bool(
+        indirect_var_names and arg.name in indirect_var_names
     )
 
 
@@ -976,8 +982,6 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                                 + "],"
                             )
                             buf.writeline(f"allocation={arg.allocation!r},")
-                            if arg.stride_map is not None:
-                                buf.writeline(f"stride_map={arg.stride_map!r},")
                             if arg.per_tile_fixed:
                                 buf.writeline("per_tile_fixed=True,")
                             if arg.name is not None:
@@ -987,7 +991,9 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
-def simplify_op_spec(op_spec):
+def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
+    # Both parameters must be provided together for gather kernels — indirect_sizes
+    # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
     it_space = op_spec.iteration_space
 
     new_op_space_splits, new_tensors = align_tensors(
@@ -996,39 +1002,17 @@ def simplify_op_spec(op_spec):
             {"size": arg.device_size, "coordinates": arg.device_coordinates}
             for arg in op_spec.args
         ],
+        indirect_sizes,
     )
     op_spec.iteration_space = new_op_space_splits
 
     for arg, t in zip(op_spec.args, new_tensors):
-        old_coords = arg.device_coordinates
-        old_stride_map = arg.stride_map
         arg.device_size = t["size"]
         arg.device_coordinates = t["coordinates"]
-        # Invariant: stride_map[d] must be the host-element stride for
-        # device dimension d.  align_tensors may reorder device_coordinates
-        # without touching stride_map, breaking this invariant.  Restore it
-        # by remapping each entry: for every new coordinate at position d,
-        # locate the old position that held the same iteration symbol and
-        # carry its stride value forward.
-        if old_stride_map is not None:
-            # Extend if align_tensors added coordinate dimensions, padding
-            # with 0 (those positions will never drive a non-zero delta).
-            new_stride_map = list(old_stride_map) + [0] * max(
-                0, len(arg.device_coordinates) - len(old_stride_map)
-            )
-            old_sym_to_idx = {}
-            for j, coord in enumerate(old_coords):
-                for sym in coord.free_symbols:
-                    old_sym_to_idx.setdefault(sym, j)
-            for d, coord in enumerate(arg.device_coordinates):
-                syms = coord.free_symbols
-                if not syms:
-                    continue
-                j = old_sym_to_idx.get(next(iter(syms)))
-                if j is not None and j < len(old_stride_map):
-                    new_stride_map[d] = old_stride_map[j]
-            # TODO: consider whether this stick-dim stride preservation should
-            # apply to other op types once another validated case needs it.
-            if SHARED_WEIGHT_UNIT_BMM_INFO_KEY in op_spec.op_info and old_stride_map:
-                new_stride_map[-1] = old_stride_map[-1]
-            arg.stride_map = new_stride_map
+
+        # Apply indirect_access_subs after align_tensors, so that indirect symbols
+        # are decomposed as regular variables before substitution.
+        if indirect_access_subs:
+            arg.device_coordinates = [
+                c.xreplace(indirect_access_subs) for c in arg.device_coordinates
+            ]

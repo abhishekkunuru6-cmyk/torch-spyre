@@ -27,7 +27,7 @@ import regex as re
 import pytest  # type: ignore
 import torch.utils._pytree as pytree
 
-from oot_test_utilities import (
+from .oot_test_utilities import (
     _OOT_PLATFORM_ARCH,
     _extract_base_module_name,
     _get_privateuse1_device_type,
@@ -132,7 +132,7 @@ class _OOTNativeDeviceTypesPatcher:
     global directly.
 
     NATIVE_DEVICES already includes torch._C._get_privateuse1_backend_name()
-    but TorchTestBase.device_type is reset to the literal string "privateuse1"
+    but OOTTestBase.device_type is reset to the literal string "privateuse1"
     in setUpClass when PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1 is set.
     That means the runtime check sees "privateuse1" and misses the registered
      name entry.
@@ -217,7 +217,7 @@ class _OOTOnlyOnPatcher:
                 if isinstance(val.device_type, list):
                     if self._PRIVATEUSE1 not in val.device_type:
                         val.device_type.append(self._PRIVATEUSE1)
-                    # Also append "privateuse1" because TorchTestBase.device_type is
+                    # Also append "privateuse1" because OOTTestBase.device_type is
                     # reset to "privateuse1" in setUpClass (to preserve correct class
                     # naming for PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1), so the
                     # @onlyOn check sees "privateuse1" at runtime, not the registered

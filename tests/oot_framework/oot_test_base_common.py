@@ -12,7 +12,7 @@ import warnings
 import pytest  # type: ignore
 import torch
 
-from oot_test_constants import (
+from oot_framework.oot_test_constants import (
     _DYNAMIC_TAG_PREFIXES,
     DEFAULT_FLOATING_PRECISION,
     ENV_TEST_CONFIG,
@@ -22,18 +22,18 @@ from oot_test_constants import (
     MODE_XFAIL_STRICT,
     UNLISTED_MODE_XFAIL,
 )
-from oot_test_matching import (
+from oot_framework.oot_test_matching import (
     extract_dtype_from_name,
     parse_dtype,
 )
-from oot_test_parsing import (
+from oot_framework.oot_test_parsing import (
     FileEntry,
     apply_op_config_overrides,
     load_yaml_config,
     resolve_current_file,
 )
 
-from oot_upstream_patcher import (
+from oot_framework.oot_upstream_patcher import (
     _OOTDtypePatcher,
     _OOTModuleMarkerPatcher,
     _OOTOnlyOnPatcher,
@@ -47,18 +47,18 @@ from oot_upstream_patcher import (
     _OOTCpuMovePatcher,
     _OOTPlatformMarkerPatcher,
 )
-from oot_test_config_models import (
+from oot_framework.oot_test_config_models import (
     OOTTestConfig,
     Precision,
     SupportedOpConfig,
     SupportedModuleConfig,
     TestEntry,
 )
-from oot_test_common_methods_invocations import (
+from oot_framework.oot_test_common_methods_invocations import (
     create_module_inputs_func_from_yaml,
     create_module_inputs_func_from_config,
 )
-from oot_test_utilities import (
+from oot_framework.oot_test_utilities import (
     _get_privateuse1_device_type,
     _log_warning,
     _log_error,
@@ -86,7 +86,7 @@ def remove_builtin_privateuse1_test_base():
     """
     Remove built-in PrivateUse1TestBase from device_type_test_bases.
 
-    This ensures only TorchTestBase handles the privateuse1 device type,
+    This ensures only OOTTestBase handles the privateuse1 device type,
     preventing nondeterministic overwrites when list(set(...)) randomizes order.
 
     Side effect: Modifies the global device_type_test_bases list in-place.
@@ -106,12 +106,12 @@ remove_builtin_privateuse1_test_base()
 
 
 # ---------------------------------------------------------------------------
-# TorchTestBase
+# OOTTestBase
 # ---------------------------------------------------------------------------
 
 
 # PrivateUse1TestBase injected via globals() by runpy
-class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F821
+class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F821
     """Base class for OOT Device PyTorch test overrides.
 
     All configuration is loaded lazily from the YAML file pointed to by
@@ -154,9 +154,9 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
         # causing subsequent instantiate_device_type_tests calls to generate class
         # names like TestOldViewOpsSPYRE instead of TestOldViewOpsPRIVATEUSE1,
         # which then get filtered out by PYTORCH_TESTING_DEVICE_ONLY_FOR=privateuse1.
-        # Reset TorchTestBase.device_type to "privateuse1" so subsequent
+        # Reset OOTTestBase.device_type to "privateuse1" so subsequent
         # calls generate the correct class name.
-        TorchTestBase.device_type = "privateuse1"
+        OOTTestBase.device_type = "privateuse1"
 
     # ------------------------------------------------------------------
     # Config loading  (called once per test run via instantiate_test)
@@ -812,4 +812,4 @@ class TorchTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa:
                     pass
 
 
-TEST_CLASS = TorchTestBase
+TEST_CLASS = OOTTestBase
