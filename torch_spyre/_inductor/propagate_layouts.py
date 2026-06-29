@@ -181,10 +181,10 @@ def _make_output_stl(
     """
     dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
-    out_coords = host_coordinates(output, output_dep)
+    out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
-    coords = device_coordinates(stl, output_dep)
+    coords = device_coordinates(stl, output_dep, None)
     if is_stick_expr_offset_free(coords[-1], stick_size):
         return stl
     return None
@@ -380,8 +380,8 @@ def _single_arg_op_layout(
         out_device_dtype = get_device_dtype(output.dtype)
         out_dtype_for_layout = output.dtype
 
-    in_coords = host_coordinates(in_layout, dep)
-    out_coords = host_coordinates(output, output_dep)
+    in_coords = host_coordinates(in_layout, dep, None)
+    out_coords = host_coordinates(output, output_dep, None)
     if (
         in_coords == out_coords
         and in_layout.size == output.size
