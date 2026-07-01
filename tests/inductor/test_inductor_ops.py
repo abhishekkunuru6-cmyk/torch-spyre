@@ -4203,14 +4203,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     lambda t: t[:, 32:224, :],
                     cached_randn((9, 256, 32), differentiation="ph_3d_gap1"),
                 ),
-                # Transpose first, then slice on dim0 of the transposed layout
-                # (non-stick). _eager_view_input_layout takes the sub-region
-                # branch: real_input.stride() == _base.stride() (both are the
-                # transposed stride), so size/stride are rewritten to the
-                # transposed base geometry and the offset is attached.
+                # Transpose then slice on dim0 (non-stick). _base is the
+                # pre-transpose tensor, so strides differ and this takes the
+                # offset-only branch (permutation preserved, offset attached).
                 "3d_transposed_then_offset_dim0": (
                     lambda t: t.transpose(0, 1)[1:, :, :],
                     cached_randn((5, 3, 128), differentiation="ph_3d_t01_sliced"),
+                ),
+                # Non-stick dim offset whose base row length (100) isn't a
+                # multiple of elem_in_stick (64).
+                "2d_offset_dim0_nonstick_multiple": (
+                    lambda t: t[1:, :],
+                    cached_randn((4, 100), differentiation="ph_2d_offset0_nonstick"),
                 ),
             },
         },
@@ -4619,9 +4623,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
         # Stick-dim placeholder offset: alt-layout retargeting not yet
-        # implemented (#2750), so both paths must raise rather than
-        # silently miscompute. Compiled raises Unsupported; eager raises
-        # a different upstream error, so only Exception is asserted there.
+        # implemented (#2750), so compile must raise rather than silently
+        # miscompute. No eager arm: compile=False skips the Inductor pass
+        # entirely, so it can't exercise this check.
         def fn(x):
             return x + x
 
@@ -4629,9 +4633,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         with pytest.raises(Exception, match="Unsupported"):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
-
-        with pytest.raises(Exception):
-            _compile_and_run(fn, [dev_view], "spyre", compile=False)
 
     def test_storage_offset_placeholder_vs_internal_equivalence(self):
         # The same slice, once with the offset baked in BEFORE compile

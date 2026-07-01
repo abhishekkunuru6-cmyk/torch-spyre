@@ -1027,13 +1027,24 @@ def _eager_view_input_layout(
         return None
 
     elem_in_stick = get_elem_in_stick(ptl.dtype)
+    # storage_offset is a flat host offset, not a device stick coordinate.
+    # A placeholder's default device layout treats base's last dim as the
+    # stick dim and pads each "row" to a whole number of sticks, so any
+    # offset landing on a row boundary (a multiple of base's last-dim size)
+    # is always device-stick-aligned, regardless of whether the row length
+    # itself is a multiple of elem_in_stick. Only the remainder within a
+    # row -- the offset actually landing partway into the stick dim --
+    # needs to be checked against elem_in_stick.
     # TODO: unaligned stick-dim offsets need alt-layout retargeting;
     # currently rejected to avoid silent miscompute downstream.
-    if storage_offset % elem_in_stick != 0:
+    last_dim_size = concretize_expr(base.size(-1))
+    stick_local_offset = storage_offset % last_dim_size
+    if stick_local_offset % elem_in_stick != 0:
         raise Unsupported(
             f"graph input {name} has stick-dim unaligned "
-            f"storage_offset={storage_offset} (not a multiple of "
-            f"{elem_in_stick}); not yet supported"
+            f"storage_offset={storage_offset} (offset {stick_local_offset} "
+            f"within the stick dim is not a multiple of {elem_in_stick}); "
+            f"not yet supported"
         )
 
     if is_sub_region:
