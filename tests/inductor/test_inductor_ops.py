@@ -4203,6 +4203,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     lambda t: t[:, 32:224, :],
                     cached_randn((9, 256, 32), differentiation="ph_3d_gap1"),
                 ),
+                # Slice on dim0 (non-stick) then transpose dims 0 and 1.
+                # _eager_view_input_layout takes the offset-only branch here:
+                # stride differs from base (permuted), but storage_offset != 0,
+                # so view's permuted size/stride is kept and the offset is attached.
+                "3d_offset_dim0_transposed": (
+                    lambda t: t[1:, :, :].transpose(0, 1),
+                    cached_randn((5, 3, 128), differentiation="ph_3d_t01"),
+                ),
             },
         },
         # Stick dim, unaligned offset: needs Step 2 (alt-layout, #2750).
@@ -4607,6 +4615,31 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         for mode_name, compile_mode in (("compiled", True), ("eager", False)):
             result = _compile_and_run(fn, [dev_view], "spyre", compile=compile_mode)
+            assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+                f"{mode_name}: max abs diff: "
+                f"{(result.float() - expected).abs().max().item()}"
+            )
+
+    def test_storage_offset_placeholder_matmul(self):
+        # mm where the LHS is a non-stick-dim offset-bearing placeholder.
+        # Exercises the two-argument path (offset on x, clean w) that the
+        # symmetric x+x param_sets cannot reach.
+        def fn(x, w):
+            return torch.mm(x, w)
+
+        base = cached_randn((5, 128), differentiation="ph_mm_base")
+        w = cached_randn((128, 64), differentiation="ph_mm_w")
+
+        cpu_view = base.clone()[1:, :]
+        expected = fn(cpu_view, w.clone()).float()
+
+        dev_view = base.clone().to("spyre")[1:, :]
+        dev_w = w.clone().to("spyre")
+
+        for mode_name, compile_mode in (("compiled", True), ("eager", False)):
+            result = _compile_and_run(
+                fn, [dev_view, dev_w], "spyre", compile=compile_mode
+            )
             assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
                 f"{mode_name}: max abs diff: "
                 f"{(result.float() - expected).abs().max().item()}"
