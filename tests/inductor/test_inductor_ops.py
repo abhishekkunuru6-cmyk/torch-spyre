@@ -4203,13 +4203,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     lambda t: t[:, 32:224, :],
                     cached_randn((9, 256, 32), differentiation="ph_3d_gap1"),
                 ),
-                # Slice on dim0 (non-stick) then transpose dims 0 and 1.
-                # _eager_view_input_layout takes the offset-only branch here:
-                # stride differs from base (permuted), but storage_offset != 0,
-                # so view's permuted size/stride is kept and the offset is attached.
-                "3d_offset_dim0_transposed": (
-                    lambda t: t[1:, :, :].transpose(0, 1),
-                    cached_randn((5, 3, 128), differentiation="ph_3d_t01"),
+                # Transpose first, then slice on dim0 of the transposed layout
+                # (non-stick). _eager_view_input_layout takes the sub-region
+                # branch: real_input.stride() == _base.stride() (both are the
+                # transposed stride), so size/stride are rewritten to the
+                # transposed base geometry and the offset is attached.
+                "3d_transposed_then_offset_dim0": (
+                    lambda t: t.transpose(0, 1)[1:, :, :],
+                    cached_randn((5, 3, 128), differentiation="ph_3d_t01_sliced"),
                 ),
             },
         },
