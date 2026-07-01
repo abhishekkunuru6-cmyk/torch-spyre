@@ -142,6 +142,21 @@ def infer_bool_device_dtype(args: list[PropArg]) -> DataFormats:
     return device_dtype
 
 
+def resolve_bool_layout_dtype(
+    stl: SpyreTensorLayout, context: str = "result"
+) -> torch.dtype:
+    """Return the logical dtype for a bool tensor physically stored as `stl`.
+
+    Raises Unsupported if `stl.device_dtype` has no bool-equivalent dtype.
+    """
+    dtype_for_layout = bool_equivalent_dtype(stl.device_dtype)
+    if dtype_for_layout is None:
+        raise Unsupported(
+            f"torch.bool {context} of operand with device format {stl.device_dtype}"
+        )
+    return dtype_for_layout
+
+
 def _compute_dim_order(stick_dim, size, coords):
     """Order dimensions with stick_dim last, placing size-one dimensions to the right to avoid tiling."""
     dim_order = [d for d in range(len(size)) if d != stick_dim and coords[d] != 0]
@@ -249,16 +264,23 @@ def _single_arg_op_layout(
     data = op.data
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
-    stick_size = get_elem_in_stick(output.dtype)
 
     if isinstance(data, Reduction):
+        # A bool result's physical format matches its operand's, not
+        # get_elem_in_stick(torch.bool)'s hardcoded SEN169_FP16.
+        if output.dtype == torch.bool:
+            out_dtype_for_layout = resolve_bool_layout_dtype(stl)
+        else:
+            out_dtype_for_layout = output.dtype
+        stick_size = get_elem_in_stick(out_dtype_for_layout)
+
         x_dev_coords = device_coordinates(stl, dep, None)
         out_coords = host_coordinates(output, output_dep, None)
         x_stick_expr = x_dev_coords[-1]
 
         # Try to preserve input layout
         out_stl = _output_stl_from_stick_expr(
-            x_stick_expr, output, output_dep, c_size, c_stride
+            x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
         )
         if out_stl is not None:
             return [out_stl]
@@ -282,7 +304,12 @@ def _single_arg_op_layout(
                 if out_stick_dim < 0:
                     continue
             out_stl = _make_output_stl(
-                output, output_dep, c_size, c_stride, out_stick_dim
+                output,
+                output_dep,
+                c_size,
+                c_stride,
+                out_stick_dim,
+                out_dtype_for_layout,
             )
             if out_stl is not None:
                 layouts.append(out_stl)
@@ -294,10 +321,9 @@ def _single_arg_op_layout(
     origin_node = next(iter(data.origins))
     aten_op = origin_node.target
     match aten_op:
-        case prims.convert_element_type.default if stl.elems_per_stick() != (
-            stl.elems_per_stick()
-            if output.dtype == torch.bool
-            else get_elem_in_stick(output.dtype)
+        case prims.convert_element_type.default if (
+            output.dtype != torch.bool
+            and stl.elems_per_stick() != get_elem_in_stick(output.dtype)
         ):
             # Type conversion may require padding when input has padding due to stick
             # alignment. For example, 4x16 FP16 has 48 elements of padding (64 total),
@@ -322,22 +348,16 @@ def _single_arg_op_layout(
                 fmt = ElementArrangement.DL16_TO_FP32
             unaligned = concretize_expr(stick_dim_size % in_elems_per_stick)
 
-            # A cast to bool is a same-width reinterpret (see
-            # DtypeOpTable._IDENTITY_DTYPES), so the output's physical
-            # format -- and thus elems_per_stick -- matches the input's,
-            # not get_device_dtype(torch.bool)'s hardcoded SEN169_FP16.
-            out_dtype_for_layout = (
-                in_equivalent_dtype if output.dtype == torch.bool else output.dtype
-            )
-
             if unaligned > 0:
                 outer_sizes = [concretize_expr(s) for s in output.size[:-1]]
                 outer_strides = [concretize_expr(s) for s in output.stride[:-1]]
                 c_size = outer_sizes + [in_elems_per_stick]
                 c_stride = outer_strides + [1]
 
+            # This case's guard excludes output.dtype == torch.bool, so
+            # output.dtype is always the real physical dtype here.
             stl = SpyreTensorLayout(
-                c_size, c_stride, out_dtype_for_layout, list(range(len(c_size))), fmt
+                c_size, c_stride, output.dtype, list(range(len(c_size))), fmt
             )
             return [stl]
 
@@ -371,11 +391,7 @@ def _single_arg_op_layout(
         # physical format directly -- get_device_dtype(torch.bool) always
         # maps to SEN169_FP16, which is wrong for e.g. a float32 operand.
         out_device_dtype = stl.device_dtype
-        out_dtype_for_layout = bool_equivalent_dtype(stl.device_dtype)
-        if out_dtype_for_layout is None:
-            raise Unsupported(
-                f"torch.bool result of operand with device format {stl.device_dtype}"
-            )
+        out_dtype_for_layout = resolve_bool_layout_dtype(stl)
     else:
         out_device_dtype = get_device_dtype(output.dtype)
         out_dtype_for_layout = output.dtype
@@ -442,11 +458,7 @@ def _clone_layout(
     # input's -- substitute the equivalent logical dtype since
     # get_device_dtype(torch.bool) can't express that.
     if output.dtype == torch.bool:
-        dtype_for_layout = bool_equivalent_dtype(in_stl.device_dtype)
-        if dtype_for_layout is None:
-            raise Unsupported(
-                f"torch.bool clone of operand with device format {in_stl.device_dtype}"
-            )
+        dtype_for_layout = resolve_bool_layout_dtype(in_stl, "clone")
     else:
         dtype_for_layout = output.dtype
     stick_size = get_elem_in_stick(dtype_for_layout)

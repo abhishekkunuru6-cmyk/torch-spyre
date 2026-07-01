@@ -17,7 +17,7 @@ test_suite_config:
         - names:
             # Standalone fp32 comparisons can't correctly read their bool result back
             # from device memory -- the read-back only supports the fp16 data format,
-            # but fp32 results need a different one. 
+            # but fp32 results need a different one.
             - LxPlanningTwoOpPointwiseAdditionTest.*::test_cmp_fp32.*
             - LxPlanningTwoOpReductionTest.*::test_cmp_fp32.*
           mode: xfail

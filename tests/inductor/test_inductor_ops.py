@@ -5966,6 +5966,14 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         x = torch.randint(0, 2, (64,), dtype=torch.bool)
         self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
 
+    def test_bool_host_reshaped_to_fp32_cpu(self):
+        # Same as test_bool_host_to_fp32_cpu, but through a reshape view first.
+        def fn(x):
+            return x.reshape(8, 8).to(dtype=torch.float32)
+
+        x = torch.randint(0, 2, (64,), dtype=torch.bool)
+        self.compare_with_cpu(fn, x, cpu_compile=False, run_eager=False)
+
     def test_bool_host_to_fp16_cpu(self):
         # Host-created bool tensors are DMA-copied (always physically
         # SEN169_FP16 on device, same as test_bool_host_to_fp32_cpu above).

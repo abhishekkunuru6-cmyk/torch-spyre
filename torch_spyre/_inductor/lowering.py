@@ -898,6 +898,18 @@ def _peel(node):
     return node
 
 
+def _peel_through_views(node):
+    """Like _peel, but also unwraps views (reshape/expand/slice/etc.).
+
+    A view (e.g. ir.ReinterpretView) is not a MutableBox/StorageBox, so plain
+    _peel stops at the view instead of reaching the Buffer underneath it.
+    """
+    node = _peel(node)
+    while isinstance(node, ir.BaseView):
+        node = _peel(node.data)
+    return node
+
+
 def _copy_back_candidate(dst, src) -> bool:
     """Whether ``copy_(dst, src)`` is worth checking after layout propagation.
 
@@ -1085,8 +1097,10 @@ def to_dtype(x, dst_dtype):
     # DMA-copied bool InputBuffers have a different HBM element ordering that
     # produces wrong results (28/64 elements shuffled). Fall back to CPU for
     # host-created bool → float32; on-device computed bools use the native path.
+    # Peel through views (e.g. reshape/expand) too, since a viewed host bool
+    # is still backed by the same DMA-copied InputBuffer.
     if src_dtype == torch.bool and dst_dtype == torch.float32:
-        if isinstance(_peel(x), ir.InputBuffer):
+        if isinstance(_peel_through_views(x), ir.InputBuffer):
             op = torch.ops.spyre.to_dtype_cpu.default
             return eager_fallback(op, x, dst_dtype)
 
