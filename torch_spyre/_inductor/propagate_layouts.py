@@ -55,6 +55,7 @@ from .constants import (
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
     ELIDED_COPY_BACK_ATTR,
+    REDUCTIONS_NON_STICK_DIM_ONLY,
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
@@ -275,23 +276,34 @@ def _single_arg_op_layout(
         stick_size = get_elem_in_stick(out_dtype_for_layout)
 
         x_dev_coords = device_coordinates(stl, dep, None)
-        out_coords = host_coordinates(output, output_dep, None)
         x_stick_expr = x_dev_coords[-1]
-
-        # Try to preserve input layout
-        out_stl = _output_stl_from_stick_expr(
-            x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
-        )
-        if out_stl is not None:
-            return [out_stl]
-
-        # Try alternative layouts when input layout is not supported
-        in_coords = host_coordinates(in_layout, dep, None)
         reduction_var = next(
             iter(dep.index.free_symbols - output_dep.index.free_symbols), None
         )
+
+        # Do not preserve the input layout for reduction ops listed in
+        # REDUCTIONS_NON_STICK_DIM_ONLY when reducing along the stick
+        # dimension. Those reductions are currently unsupported in the backend.
+        # See backend issue #4409.
+        if not (
+            data.reduction_type in REDUCTIONS_NON_STICK_DIM_ONLY
+            and reduction_var in x_stick_expr.free_symbols
+        ):
+            # Try to preserve input layout
+            out_stl = _output_stl_from_stick_expr(
+                x_stick_expr, output, output_dep, c_size, c_stride, out_dtype_for_layout
+            )
+            if out_stl is not None:
+                return [out_stl]
+
+        # Try alternative layouts when input layout is not supported
+        in_coords = host_coordinates(in_layout, dep, None)
+        out_coords = host_coordinates(output, output_dep, None)
+        stick_dim = matching_dim(in_coords, x_stick_expr)
         layouts = []
         for in_dim in range(len(in_layout.size)):
+            if in_dim == stick_dim:
+                continue
             if concretize_expr(in_layout.size[in_dim]) % stick_size != 0:
                 # TODO: Support dimensions with size not divisible by stick_size via padding (See #1756)
                 continue
@@ -681,13 +693,11 @@ def _multi_arg_pointwise_layouts(
     """
 
     ind_names, _, ind_sizes = indirect_info_from_op(op)
-    # Collect all unique non-zero stick expressions from input layouts
     stick_exprs = {
-        stick_expr
+        device_coordinates(stl, arg.dep, ind_sizes)[-1]
         for arg in args
         for stl in arg.layouts
         if arg.dep.name not in ind_names
-        and (stick_expr := device_coordinates(stl, arg.dep, ind_sizes)[-1]) != 0
     }
 
     if output.dtype == torch.bool:
@@ -939,6 +949,7 @@ def _all_constant_layouts(op: Operation) -> list[SpyreTensorLayout]:
             [d for d in range(len(c_size)) if d != stick_dim] + [stick_dim],
         )
         for stick_dim in range(len(c_size))
+        if c_size[stick_dim] > 1  # no sticks of size 1
     ]
     if not layouts:
         layouts = [generic_layout(op)]
