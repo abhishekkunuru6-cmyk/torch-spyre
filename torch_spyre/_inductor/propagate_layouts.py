@@ -86,7 +86,7 @@ from .pass_utils import (
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
-from .views import compute_coordinates, matching_dim
+from .views import matching_dim
 
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
@@ -1581,7 +1581,6 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
 def _eager_view_input_layout(
     real_input: torch.Tensor,
     ptl: FixedLayout,
-    name: str,
 ) -> "FixedLayout | None":
     """Rewrite a placeholder view's FixedLayout to "layout = base, dep = view".
 
@@ -1632,32 +1631,14 @@ def _eager_view_input_layout(
         new_size = list(real_input.size())
         new_stride = list(real_input.stride())
 
-    # Verify the offset is device-stick-aligned by computing the real
-    # device stick coordinate for a full read of this view, using the same
-    # device-coordinate machinery (compute_coordinates +
-    # is_stick_expr_offset_free) already relied on elsewhere in this module
-    # for equivalent checks. A flat host-offset heuristic can't see per-row
-    # stick padding -- a row boundary can be device-stick-aligned even when
-    # the row length itself isn't a multiple of elem_in_stick -- so the check
-    # has to happen in device space, not host space.
-    # TODO: unaligned stick-dim offsets need alt-layout retargeting;
-    # currently rejected to avoid silent miscompute downstream.
-    stl = real_input.device_tensor_layout()
-    elem_in_stick = get_elem_in_stick(ptl.dtype)
-    rank = len(real_input.shape)
-    ivars = sympy.symbols(f"_offset_check_i0:{rank}", integer=True, nonnegative=True)
-    var_ranges = {v: s for v, s in zip(ivars, real_input.shape)}
-    flat_index = storage_offset + sum(new_stride[d] * ivars[d] for d in range(rank))
-    stick_expr = compute_coordinates(
-        list(stl.device_size), list(stl.stride_map), var_ranges, flat_index
-    )[-1]
-    if not is_stick_expr_offset_free(stick_expr, elem_in_stick):
-        raise Unsupported(
-            f"graph input {name} has a non-stick-aligned device stick "
-            f"coordinate ({stick_expr}) at storage_offset={storage_offset}; "
-            f"not yet supported"
-        )
-
+    # A stick-dim offset is no longer rejected here: it flows through the
+    # index-expression machinery and is resolved downstream by the same
+    # restickify pass that handles intra-graph stick-dim slices (#2595) and
+    # mutation buffers (#2750). Cases with no offset-free alternative stick
+    # dim (e.g. no non-stick dim is a multiple of elem_in_stick) still reject
+    # cleanly downstream, and fixed-layout ops (matmul/topk/dtype-size change)
+    # reject in _check_supported_input_sticks -- so nothing silently
+    # miscomputes.
     return FixedLayout(
         device=ptl.device,
         dtype=ptl.dtype,
@@ -1694,7 +1675,7 @@ def propagate_spyre_tensor_layouts(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                new_layout = _eager_view_input_layout(real_input, ptl, name)
+                new_layout = _eager_view_input_layout(real_input, ptl)
                 if new_layout is not None:
                     tb.data.data.layout = new_layout
                 tb.layouts = [stl]

@@ -4809,16 +4809,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Non-stick dim offset whose base row length (100) isn't a multiple
-        # of elem_in_stick (64). Flat offset 100 decomposes to a device
-        # stick coordinate of Mod(i1,64)+36 -- genuinely not stick-aligned,
-        # since the device layout pads each row's tail to a partial stick
-        # rather than the row itself landing on a stick boundary. Needs
-        # padding-aware device-coordinate construction, which isn't
-        # implemented yet. Dedicated test (not folded into the ops_dict
-        # cross-product above) so the exact rejection reason can be
-        # pinned, matching test_storage_offset_placeholder_stick_dim_rejected
-        # below.
+        # Non-stick dim offset on a base whose row length (100) isn't a
+        # multiple of elem_in_stick, so compute_coordinates leaks a spurious
+        # Mod(i1,64)+36 stick residual; needs padding-aware decomposition.
         (
             "test_storage_offset_placeholder_nonstick_row",
             "test_storage_offset_placeholder_nonstick_row_rejected",
@@ -4830,8 +4823,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
-        # Stick dim, unaligned offset: needs Step 2 (alt-layout, #2750).
-        # Must cleanly fail, not silently misbehave.
+        # Stick dim, unaligned offset with NO offset-free alternative stick
+        # dim (no non-stick dim is a multiple of 64), so the restickify pass
+        # cannot resolve it and compile must reject cleanly rather than
+        # silently miscompute.
         (
             "test_storage_offset_placeholder_stick_dim",
             "test_storage_offset_placeholder_stick_dim_rejected",
@@ -4866,6 +4861,80 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 "2d_aligned_stick_offset": (
                     lambda t: t[:, 64:],
                     cached_randn((5, 128), differentiation="ph_2d_aligned_stick"),
+                ),
+            },
+        },
+        # Stick-dim placeholder offset, shapes WITH an offset-free alternative
+        # stick dim (a non-stick dim that is a multiple of 64). Resolved by the
+        # restickify pass (#2595/#2750 machinery). add/exp verified in both
+        # compiled and eager modes on hardware.
+        (
+            "test_storage_offset_placeholder_stick_dim",
+            "test_storage_offset_placeholder",
+        ): {
+            "ops_dict": {
+                "add": lambda x: x + x,
+                "exp": torch.exp,
+            },
+            "param_sets": {
+                # 2D: dim0=128 is the restickify target
+                "2d_stick_off32": (
+                    lambda t: t[:, 32:96],
+                    cached_randn((128, 256), differentiation="ph_2d_stick32"),
+                ),
+                "2d_stick_off32_span128": (
+                    lambda t: t[:, 32:160],
+                    cached_randn((128, 256), differentiation="ph_2d_stick32_s128"),
+                ),
+                # 3D: dim0=128 and/or dim1=192 are restickify targets
+                "3d_stick_off32": (
+                    lambda t: t[:, :, 32:96],
+                    cached_randn((128, 192, 256), differentiation="ph_3d_stick32"),
+                ),
+                "3d_stick_off32_span128": (
+                    lambda t: t[:, :, 32:160],
+                    cached_randn((128, 192, 256), differentiation="ph_3d_stick32_s128"),
+                ),
+            },
+        },
+        # Stick-dim placeholder offset, ops that only work in COMPILED mode
+        # (eager clone gets its own single-op graph and cannot restickify).
+        (
+            "test_storage_offset_placeholder_stick_dim_compiled_only",
+            "test_storage_offset_placeholder_compiled_only",
+        ): {
+            "ops_dict": {
+                "clone": torch.clone,
+                "add_asymmetric": lambda x: x.clone() + x,
+            },
+            "param_sets": {
+                "2d_stick_off32": (
+                    lambda t: t[:, 32:96],
+                    cached_randn((128, 256), differentiation="ph_2d_stick32_co"),
+                ),
+                "3d_stick_off32_span128": (
+                    lambda t: t[:, :, 32:160],
+                    cached_randn((128, 192, 256), differentiation="ph_3d_stick32_co"),
+                ),
+            },
+        },
+        # Stick-dim placeholder offset, reductions over every dim (dual-mode,
+        # verified on hardware).
+        (
+            "test_storage_offset_placeholder_stick_dim_reduce",
+            "test_storage_offset_placeholder",
+        ): {
+            "ops_dict": {
+                "sum_dim0": lambda x: torch.sum(x, dim=0, keepdim=True),
+                "sum_dim1": lambda x: torch.sum(x, dim=1, keepdim=True),
+                "amax_dim0": lambda x: torch.amax(x, dim=0, keepdim=False),
+                "amax_dim1": lambda x: torch.amax(x, dim=1, keepdim=False),
+                "amax_dim2": lambda x: torch.amax(x, dim=2, keepdim=False),
+            },
+            "param_sets": {
+                "3d_stick_off32_span128": (
+                    lambda t: t[:, :, 32:160],
+                    cached_randn((128, 192, 256), differentiation="ph_3d_reduce"),
                 ),
             },
         },
@@ -5527,24 +5596,45 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 f"{(result.float() - expected).abs().max().item()}"
             )
 
+    def test_storage_offset_placeholder_compiled_only(self, op, slicer, base):
+        # Same as test_storage_offset_placeholder but compiled-only: eager
+        # splits multi-op / clone cases into single-op graphs that cannot
+        # resolve the restickify, so those ops are supported in compiled mode
+        # only.
+        cpu_view = slicer(base.clone())
+        expected = op(cpu_view).float()
+
+        dev_view = slicer(base.clone().to("spyre"))
+        result = _compile_and_run(op, [dev_view], "spyre", compile=True)
+        assert torch.allclose(result.float(), expected, atol=0.1, rtol=0.1), (
+            f"max abs diff: {(result.float() - expected).abs().max().item()}"
+        )
+
     def test_storage_offset_placeholder_stick_dim_rejected(self, slicer, base):
-        # Stick-dim placeholder offset: alt-layout retargeting not yet
-        # implemented (#2750), so compile must raise rather than silently
-        # miscompute. No eager arm: compile=False skips the Inductor pass
-        # entirely, so it can't exercise this check.
+        # Stick-dim placeholder offset with NO offset-free alternative stick
+        # dim (no non-stick dim is a multiple of elem_in_stick), so the
+        # restickify pass cannot resolve it and compile rejects cleanly rather
+        # than silently miscompute. No eager arm: compile=False skips the
+        # Inductor pass entirely, so it can't exercise this check.
         def fn(x):
             return x + x
 
         dev_view = slicer(base.clone().to("spyre"))
 
-        with pytest.raises(Exception, match="Unsupported"):
+        with pytest.raises(
+            Exception, match="no mechanism to resolve stick incompatibility"
+        ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
     def test_storage_offset_placeholder_nonstick_row_rejected(self, slicer, base):
         # Non-stick dim offset whose base row length isn't a multiple of
-        # elem_in_stick: padding-aware device-coordinate construction not
-        # yet implemented, so compile must raise rather than silently
-        # miscompute. No eager arm: compile=False skips the Inductor pass
+        # elem_in_stick: padding-aware device-coordinate construction not yet
+        # implemented, so compute_coordinates leaks a spurious stick residual
+        # and the offset is misread as a stick-dim one. It now rejects
+        # downstream in the restickify pass (dim0=4 is not a multiple of
+        # elem_in_stick, so there is no alternative stick dim) rather than at
+        # the removed _eager_view_input_layout gate. Still a clean raise, not
+        # a miscompute. No eager arm: compile=False skips the Inductor pass
         # entirely, so it can't exercise this check.
         def fn(x):
             return x + x
@@ -5552,7 +5642,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         dev_view = slicer(base.clone().to("spyre"))
 
         with pytest.raises(
-            Exception, match="non-stick-aligned device stick coordinate"
+            Exception, match="no mechanism to resolve stick incompatibility"
         ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
