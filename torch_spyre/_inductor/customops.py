@@ -756,6 +756,109 @@ def _(
     return torch.empty(1, 1, seqlen_q, seqlen_kv, dtype=dtype, device=device)
 
 
+@torch.library.custom_op(
+    "spyre::sliding_window_block_mask", mutates_args=(), device_types="spyre"
+)
+def sliding_window_block_mask(
+    q_start: int,
+    q_end: int,
+    kv_start: int,
+    kv_end: int,
+    q_kv_offset: int,
+    window_size: int,
+    is_causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Build one Q-block's additive sliding-window mask on CPU, transfer to device.
+
+    Shape: [1, 1, q_end - q_start, kv_end - kv_start]; 0.0 = keep, -inf = masked.
+    Query row i (absolute KV-cache coordinate q_kv_offset + q_start + i) may
+    attend to key column j (absolute coordinate kv_start + j) iff:
+      - causal:        0 <= (q_kv_offset + q_start + i) - (kv_start + j) < window_size
+      - bidirectional: abs((q_kv_offset + q_start + i) - (kv_start + j)) < window_size
+
+    q_kv_offset aligns query row 0 to KV coordinate q_kv_offset, matching
+    hf-adapters' KV-cache coordinate convention (add_causal_sliding_window_band
+    in hf_adapters/hf_common.py) — decode (Lq=1) and prefill (Lq=Lk) both fall
+    out of the same formula.
+
+    Built entirely on CPU so the in-place ops stay opaque to torch.compile,
+    matching spyre.causal_mask's rationale.
+    """
+    q_idx = torch.arange(q_start, q_end, device="cpu") + q_kv_offset
+    k_idx = torch.arange(kv_start, kv_end, device="cpu")
+    delta = q_idx.unsqueeze(-1) - k_idx.unsqueeze(0)
+    if is_causal:
+        allowed = (delta >= 0) & (delta < window_size)
+    else:
+        allowed = delta.abs() < window_size
+    mask_cpu = torch.zeros(
+        1, 1, q_end - q_start, kv_end - kv_start, dtype=dtype, device="cpu"
+    )
+    mask_cpu.masked_fill_(~allowed.unsqueeze(0).unsqueeze(0), float("-inf"))
+    return mask_cpu.to(device=device)
+
+
+@sliding_window_block_mask.register_fake
+def _(
+    q_start: int,
+    q_end: int,
+    kv_start: int,
+    kv_end: int,
+    q_kv_offset: int,
+    window_size: int,
+    is_causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(
+        1, 1, q_end - q_start, kv_end - kv_start, dtype=dtype, device=device
+    )
+
+
+@torch.library.custom_op(
+    "spyre::sliding_window_attention", mutates_args=(), device_types="spyre"
+)
+def sliding_window_attention(  # type: ignore[empty-body]
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    window_size: int,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Sliding-window attention entry point (issue #3073).
+
+    query: [B, Hq, Lq, D]; key/value: [B, Hkv, Lk, D] (GQA expansion handled
+    internally when Hq != Hkv). window_size is a compile-time constant (not a
+    data-dependent tensor), matching flash-attention's window_size_left
+    convention. Query row r (KV-cache coordinate max(0, Lk - Lq) + i) may
+    attend to key position c iff 0 <= r - c < window_size (causal) or
+    abs(r - c) < window_size (bidirectional).
+
+    MUST be called under torch.compile(backend="inductor") on the spyre
+    device — see spyre_sliding_window_attention in decompositions.py for the
+    real (windowed, block-skipping) Inductor lowering. This eager body is
+    intentionally empty, matching spyre::exx2 / spyre::layernormscale.
+    """
+    pass
+
+
+@sliding_window_attention.register_fake
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    window_size: int,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    return query.new_empty(query.size())
+
+
 @torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")
 def prod_dim_int(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     pass

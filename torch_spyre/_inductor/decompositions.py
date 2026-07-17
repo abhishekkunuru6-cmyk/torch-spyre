@@ -678,6 +678,199 @@ def spyre__sdpa_overrideable(
     )
 
 
+@register_spyre_decomposition([torch.ops.spyre.sliding_window_attention.default])
+def spyre_sliding_window_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    window_size: int,
+    is_causal: bool = True,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """
+    Windowed decomposition for issue #3073 (prototype).
+
+    Two-level structure, matching real flash-attention's two distinct
+    efficiency tricks rather than just one of them:
+
+    1. **Outer: block-skip.** A Python loop over Q-blocks, unrolled at trace
+       time (window_size and the block sizes are compile-time ints, not
+       tensors). Each iteration slices key/value down to only the
+       stick-rounded KV range that can fall inside that Q-block's window
+       *before* any matmul touches it — KV tiles fully outside the window are
+       never sliced into a tensor, so they're never DMA'd or multiplied. This
+       is the only part spyre_hint tiling cannot give you on its own: it
+       divides a *fixed* range into equal pieces (see coarse_tile.py's
+       _compute_full_ranges, which reconstructs the full range as
+       tiled_range * loop_count — the total swept range is invariant to the
+       hint), so an index-dependent inner bound has to come from an actual
+       Python-level slice, not a hint.
+    2. **Inner: online-softmax sweep.** Within a Q-block's window-bounded KV
+       slice, a spyre_hint-tiled running-max/denominator sweep in
+       kv_block_size chunks — the same accumulator pattern
+       spyre__sdpa_overrideable uses, just scoped to the window-bounded slice
+       instead of the full max_seqlen_kv. This matters once the slice itself
+       is large (e.g. Gemma 3's default sliding_window=4096): without it,
+       each block would materialize one big [q_block_size, kv_len] score
+       matrix in a single softmax, which is exactly the large-intermediate
+       problem flash attention's tiling exists to avoid, even though the
+       outer block-skip is already in place.
+
+    The additive-mask-over-the-full-matrix path (spyre__sdpa_overrideable +
+    an attn_bias band mask, see tests/inductor/test_sliding_window_attention.py)
+    gets neither: it always sweeps the full max_seqlen_kv range.
+    """
+    batch_size = query.size(0)
+    num_heads = query.size(1)
+    num_kvheads = key.size(1)
+    max_seqlen_q = query.size(2)
+    max_seqlen_kv = key.size(2)
+    head_dim = query.size(3)
+
+    scaling_factor = scale
+    if scaling_factor is None:
+        scaling_factor = 1.0 / math.sqrt(math.sqrt(head_dim))
+    else:
+        scaling_factor = math.sqrt(scaling_factor)
+
+    expansion = num_heads // num_kvheads
+
+    q_block_size = 64
+    kv_block_size = 64
+    num_q_blocks = -(-max_seqlen_q // q_block_size)  # ceil div
+
+    # Query row i's absolute KV-cache coordinate (hf-adapters' convention:
+    # add_causal_sliding_window_band in hf_common.py); decode (Lq=1) and
+    # prefill (Lq=Lk) both fall out of the same formula.
+    q_kv_offset = max_seqlen_kv - max_seqlen_q
+
+    out_blocks = []
+    for qi in range(num_q_blocks):
+        q_start = qi * q_block_size
+        q_end = min(max_seqlen_q, q_start + q_block_size)
+        q_len = q_end - q_start
+
+        r_lo = q_kv_offset + q_start  # first row's absolute query coordinate
+        r_hi = q_kv_offset + q_end - 1  # last row's absolute query coordinate
+
+        if is_causal:
+            kv_lo, kv_hi = r_lo - window_size + 1, r_hi
+        else:
+            kv_lo, kv_hi = r_lo - window_size + 1, r_hi + window_size - 1
+
+        # Round to kv_block_size (== elems_per_stick for fp16) boundaries:
+        # not required for correctness on an intra-graph slice (PR #2595
+        # covers sub-stick slice offsets), but keeps each block's DMA aligned
+        # to whole sticks instead of forcing a restickify on a ragged edge.
+        kv_start = max(0, (kv_lo // kv_block_size) * kv_block_size)
+        kv_end = min(max_seqlen_kv, ((kv_hi // kv_block_size) + 1) * kv_block_size)
+        assert kv_end > kv_start, (
+            f"sliding_window_attention: empty KV range for q_block {qi} "
+            f"(kv_start={kv_start}, kv_end={kv_end}) — window-range bug, "
+            "not a valid input"
+        )
+        kv_len = kv_end - kv_start
+
+        q_blk = query[:, :, q_start:q_end, :]
+        # Slice the small window range from the original [B, num_kvheads, Lk, D]
+        # tensor first, then GQA-broadcast only that slice — not the other way
+        # around. Expanding the full max_seqlen_kv-length tensor up front and
+        # slicing it per block feeds the compiler's stick-padding pass a
+        # downstream consumer that only needs a small window out of a tensor
+        # it still considers full-length, which it cannot reconcile (observed
+        # as "lower_pad_sequence: pad_extent=-129 ... original_size_dim=257" —
+        # trying to shrink instead of grow). Expanding after slicing also
+        # means less broadcast work per block, consistent with only ever
+        # touching the window range.
+        k_slice = key[:, :, kv_start:kv_end, :]
+        v_slice = value[:, :, kv_start:kv_end, :]
+        if expansion != 1:
+            k_blk = k_slice.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+            v_blk = v_slice.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+        else:
+            k_blk = k_slice
+            v_blk = v_slice
+
+        band_mask = torch.ops.spyre.sliding_window_block_mask(
+            q_start,
+            q_end,
+            kv_start,
+            kv_end,
+            q_kv_offset,
+            window_size,
+            is_causal,
+            query.dtype,
+            query.device,
+        )
+
+        # Per-block online-softmax accumulators — same running-max/denominator
+        # pattern as spyre__sdpa_overrideable's inner sweep (including its
+        # "sparse via reduction" M/denominator construction), scoped to this
+        # block's window-bounded kv_len instead of the full max_seqlen_kv.
+        M_reduced = torch.full(
+            (batch_size, num_heads, q_len, 64),
+            float("-inf"),
+            device=query.device,
+            dtype=query.dtype,
+        )
+        M = M_reduced.amax(dim=-1)
+
+        denominator_reduced = torch.zeros(
+            (batch_size, num_heads, q_len, 64),
+            device=query.device,
+            dtype=query.dtype,
+        )
+        denominator = denominator_reduced.amax(dim=-1)
+
+        out_blk = torch.zeros(
+            (batch_size, num_heads, q_len, head_dim),
+            device=query.device,
+            dtype=query.dtype,
+        )
+
+        with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
+            with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
+                with spyre_hint(tiles={"kv_window": max(1, kv_len // kv_block_size)}):
+                    with spyre_hint(work_div={"num_heads": 4, "kv_window": 8}):
+                        scaled_k_blk = (
+                            k_blk * scaling_factor
+                        )  # batch, heads, kv_len, head_dim
+                        k_blk_T = scaled_k_blk.transpose(-1, -2)
+                        scores = torch.matmul(
+                            q_blk * scaling_factor, k_blk_T
+                        )  # batch, heads, q_len, kv_len
+
+                        scores = scores + band_mask
+
+                        block_max = torch.amax(
+                            scores, dim=-1
+                        )  # batch, heads, q_len sparse
+                        max_running = torch.maximum(M, block_max)
+
+                        exp_scores = torch.exp(
+                            scores - max_running.unsqueeze(-1)
+                        )  # batch, heads, q_len, kv_len
+                        correction = torch.exp(
+                            M - max_running
+                        )  # batch, heads, q_len sparse
+
+                        denominator = torch.ops.spyre.copy_f(
+                            denominator * correction + exp_scores.sum(dim=-1),
+                            denominator,
+                        )
+                        out_blk = torch.ops.spyre.copy_f(
+                            out_blk * correction.unsqueeze(-1)
+                            + torch.matmul(exp_scores, v_blk),
+                            out_blk,
+                        )
+                        M = torch.ops.spyre.copy_f(max_running, M)
+
+        out_blk = torch.ops.spyre.copy_f(out_blk / denominator.unsqueeze(-1), out_blk)
+        out_blocks.append(out_blk)
+
+    return torch.cat(out_blocks, dim=2)
+
+
 @register_spyre_decomposition([torch.ops.aten.max.default])
 def spyre_max_default_decomp(input):
     """
