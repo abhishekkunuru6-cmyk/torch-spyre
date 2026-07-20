@@ -16,6 +16,7 @@
 import inspect
 import io
 import logging
+import time
 from typing import Optional, Any, Callable
 
 import torch
@@ -110,6 +111,26 @@ def _format_operations(operations: list[Operation]) -> str:
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()
+
+
+def _get_pass_name(pass_fn: Callable) -> str:
+    """Get a human-readable name for a pass function."""
+    if hasattr(pass_fn, "__name__"):
+        return pass_fn.__name__
+    if hasattr(pass_fn, "__func__"):
+        return pass_fn.__func__.__name__
+    return type(pass_fn).__name__
+
+
+def _should_log_pass(pass_name: str) -> bool:
+    """Check if per-pass logging is enabled for the given pass name."""
+    log_passes_cfg = config.log_passes
+    if not log_passes_cfg:
+        return False
+    if log_passes_cfg in ("all", "1"):
+        return True
+    selected = {s.strip() for s in log_passes_cfg.split(",")}
+    return pass_name in selected
 
 
 def _graph_has_spyre_device(graph: torch.fx.graph.Graph) -> bool:
@@ -361,7 +382,20 @@ class CustomPreSchedulingPasses:
             )
 
         for pass_fn in self.passes:
+            t0 = time.perf_counter()
             pass_fn(graph)
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "elapsed %5dms  %s",
+                    (time.perf_counter() - t0) * 1000,
+                    _get_pass_name(pass_fn),
+                )
+
+            pass_name = _get_pass_name(pass_fn)
+            if logger.isEnabledFor(logging.DEBUG) and _should_log_pass(pass_name):
+                logger.debug(
+                    "AFTER %s\n%s", pass_name, _format_operations(graph.operations)
+                )
 
         if logger.isEnabledFor(logging.INFO):
             logger.info(
