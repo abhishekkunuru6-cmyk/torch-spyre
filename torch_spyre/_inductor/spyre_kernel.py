@@ -598,6 +598,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         raw_tiled_red_dims: list[list[int]] = (
             li.loop_tiled_reduction_dims if li is not None else []
         )
+        # Sliding-window params, one entry per nesting level (None => partition).
+        raw_read_extent: list = li.loop_read_extent if li is not None else []
+        raw_slide_stride: list = li.loop_slide_stride if li is not None else []
         # CoarseTileInfo always constructs loop_tiled_dims and
         # loop_tiled_reduction_dims with the same length (one sublist per
         # nesting level), so max() is just a safety net; in practice both
@@ -610,6 +613,9 @@ class SpyreKernel(Kernel[CSEVariable]):
         # which throws on symbolic dimensions.  They are only needed when this
         # op is inside a tiling loop, so skip the computation for non-tiled ops.
         tiled_syms: list[list] = []
+        # tiled iteration-space Symbol -> (read_extent, slide_stride); empty for
+        # ordinary partition tiling.  Populated per level below.
+        sliding_by_sym: dict = {}
         if n_levels > 0:
             # Build host-range-index → iteration-space-key-index map by walking
             # data.ranges and counting only non-unit entries.  loop_tiled_dims
@@ -651,6 +657,13 @@ class SpyreKernel(Kernel[CSEVariable]):
                         if sym_idx < len(it_space_keys):
                             level_syms.append(it_space_keys[sym_idx])
                 tiled_syms_per_level_outermost.append(level_syms)
+                # A sliding level's (read_extent, slide_stride) applies to that
+                # level's tiled symbol(s).
+                re = raw_read_extent[lvl] if lvl < len(raw_read_extent) else None
+                ss = raw_slide_stride[lvl] if lvl < len(raw_slide_stride) else None
+                if re is not None and ss is not None:
+                    for s in level_syms:
+                        sliding_by_sym[s] = (re, ss)
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
 
@@ -686,6 +699,13 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             debug_handle = None
 
+        if any(e is not None for e in raw_read_extent):  # SWA-DEBUG
+            print(
+                f"SWA-DEBUG create_op_spec op={op}: raw_read_extent="
+                f"{raw_read_extent} raw_slide_stride={raw_slide_stride} "
+                f"sliding_by_sym={sliding_by_sym} tiled_syms={tiled_syms}",
+                flush=True,
+            )
         return OpSpec(
             op,
             is_reduction,
@@ -695,6 +715,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
             debug_handle=debug_handle,
+            sliding_symbols=sliding_by_sym,
         )
 
     def remove_kernel_local_buffers(self) -> None:
@@ -1087,6 +1108,19 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                             for level in op_spec.tiled_symbols
                         )
                         + "],"
+                    )
+                # Sliding-window params must survive the OpSpec -> generated-source
+                # -> exec round-trip, same as tiled_symbols (keys are the same
+                # symbols).  Without this the override in generate_sdsc never gets
+                # its data and the read silently stays a partition.
+                if op_spec.sliding_symbols:
+                    buf.writeline(
+                        "sliding_symbols={"
+                        + ", ".join(
+                            f"{sympy_str(k)}: {tuple(v)}"
+                            for k, v in op_spec.sliding_symbols.items()
+                        )
+                        + "},"
                     )
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"

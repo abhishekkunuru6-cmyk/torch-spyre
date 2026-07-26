@@ -401,6 +401,7 @@ def generate_sdsc(
     symbol_id_offset: int = 0,
     tiled_symbols=None,
     use_symbols: bool = False,
+    sliding_symbols=None,
 ):
     """Generate SDSC JSON for one OpSpec.
 
@@ -430,6 +431,12 @@ def generate_sdsc(
     # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
         tiled_symbols = []
+    if sliding_symbols:  # SWA-DEBUG
+        print(
+            f"SWA-DEBUG generate_sdsc idx={idx} sliding_symbols={sliding_symbols} "
+            f"tiled_symbols={tiled_symbols}",
+            flush=True,
+        )
 
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
@@ -625,7 +632,39 @@ def generate_sdsc(
                     ]
                     strides_for_level: dict = {}
                     for s in tensor_tiled_at_level:
-                        strides_for_level[s] = _tiled_byte_stride(tensor, s)
+                        stride = _tiled_byte_stride(tensor, s)
+                        # Sliding-window: the per-tile stride above was computed
+                        # for a `read_extent`-wide tile (coarse_tile set the
+                        # range to the window), but the loop actually advances by
+                        # `slide_stride`.  Scale down so the base advances by the
+                        # (smaller) stride while the read width stays the window
+                        # — the overlap.  Exact integer division: the base stride
+                        # is a multiple of read_extent.
+                        # Sliding-window: scale the per-tile stride down so the
+                        # base advances by slide_stride while the read width
+                        # stays read_extent (re-sync marker v2).
+                        if sliding_symbols and s in sliding_symbols:
+                            read_extent, slide_stride = sliding_symbols[s]
+                            # EXPERIMENT: the base _tiled_byte_stride already
+                            # equals slide_stride (the backGap adjustment for
+                            # it_dim_size=read_extent produced it).  So do NOT
+                            # scale; only drop the intra-op backGap, which was
+                            # computed for a partition (next tile at base +
+                            # it_dim_size) and is wrong for a sliding read where
+                            # the affine stride owns the advance.
+                            new_stride = stride  # no scaling
+                            popped = tensor.backGap.pop(s, None)
+                            print(  # SWA-DEBUG
+                                f"SWA-DEBUG override sym={s} "
+                                f"base_byte_stride={stride} -> {new_stride} "
+                                f"(read_extent={read_extent} "
+                                f"slide_stride={slide_stride}) "
+                                f"tensor.strides[s]={tensor.strides.get(s)} "
+                                f"dropped_backGap={popped}",
+                                flush=True,
+                            )
+                            stride = new_stride
+                        strides_for_level[s] = stride
                         any_tiled = True
                     per_level_strides.append(strides_for_level)
             else:

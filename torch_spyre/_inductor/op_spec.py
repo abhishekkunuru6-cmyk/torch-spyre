@@ -168,6 +168,16 @@ class OpSpec:
         default_factory=dict
     )
     debug_handle: DebugHandle | None = None
+    # Sliding-window tiling: maps a tiled iteration-space Symbol ->
+    # (read_extent, slide_stride).  Empty => ordinary partition tiling (the
+    # default).  When a tiled symbol is present here, the affine-stride codegen
+    # advances a reading tensor's base by ``slide_stride`` each iteration while
+    # the per-iteration read width stays ``read_extent`` — so consecutive reads
+    # OVERLAP when ``read_extent > slide_stride``.  Populated in create_op_spec
+    # from CoarseTileInfo.loop_read_extent / loop_slide_stride.
+    sliding_symbols: dict[Symbol, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass

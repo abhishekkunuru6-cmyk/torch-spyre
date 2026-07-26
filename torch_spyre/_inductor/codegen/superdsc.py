@@ -493,6 +493,13 @@ def _create_sdsc_tensors(
 
             dim_coord = arg.device_coordinates[-stride_idx - 2]
             if not isinstance(dim_coord, IndirectAccess) and dev_dim_size > it_dim_size:
+                print(  # SWA-DEBUG
+                    f"SWA-DEBUG superdsc backGap: op={op_spec.op} dim={dim} "
+                    f"dev_dim_size={dev_dim_size} it_dim_size={it_dim_size} "
+                    f"strides_before={strides[dim]} scale={scales.get(dim)} "
+                    f"reduced={dim in reduced_dims}",
+                    flush=True,
+                )
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size
@@ -916,6 +923,13 @@ def compile_op_spec(
         [symbol_mapping[s] for s in level if s in symbol_mapping]
         for level in reversed(op_spec.tiled_symbols)
     ]
+    # Translate sliding-window params to the renamed SDSC symbols (same mapping
+    # used for tiled_symbols).  Empty for ordinary partition tiling.
+    sliding_symbols = {
+        symbol_mapping[s]: params
+        for s, params in op_spec.sliding_symbols.items()
+        if s in symbol_mapping
+    }
     return generate_sdsc(
         idx,
         sdsc_spec,
@@ -923,4 +937,5 @@ def compile_op_spec(
         symbol_id_offset,
         tiled_symbols=tiled_symbols_per_level,
         use_symbols=use_symbols,
+        sliding_symbols=sliding_symbols,
     )

@@ -2053,15 +2053,36 @@ def _stamp_group(
                 is not None
             }
 
+        # Build lookup: hint_id → (read_extent, slide_stride) for sliding-window
+        # tiling.  Absent for ordinary partition hints (read_extent is None).
+        hint_id_to_sliding: dict[int, tuple[int, int]] = {
+            h.hint_id: (h.read_extent, h.slide_stride)
+            for h in getattr(op, "dim_hints", [])
+            if h.read_extent is not None and h.slide_stride is not None
+        }
+
         op_tiled_dims: list[list[int]] = []
         op_tiled_reduction_dims: list[list[int]] = []
+        op_slide_stride: list[int | None] = []
+        op_read_extent: list[int | None] = []
         for hint_id, count in levels:
             opos = hint_id_to_ranges_pos.get(hint_id)
             rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
+            sliding = hint_id_to_sliding.get(hint_id)
+            window = sliding[0] if sliding is not None else None
             op_tiled_dims.append([opos] if opos is not None else [])
             op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
-            # _divide_ranges with tiled_dims=[] is a no-op.
-            retiled_info = _divide_ranges(op, count, [opos] if opos is not None else [])
+            op_slide_stride.append(sliding[1] if sliding is not None else None)
+            op_read_extent.append(window)
+            # _divide_ranges with tiled_dims=[] is a no-op.  For a sliding level
+            # `window` sizes the per-iteration read; the overlap comes downstream
+            # (the affine-stride scaling).  Note: for overlapping windows
+            # count * window != original range (windows overlap by design), so
+            # the `window` path deliberately bypasses the partition divisibility
+            # check in _divide_ranges / _divide_reduction_ranges.
+            retiled_info = _divide_ranges(
+                op, count, [opos] if opos is not None else [], window=window
+            )
             if retiled_info is not None:
                 name = op.get_name()
                 prior = retiled_infos.get(name)
@@ -2077,13 +2098,26 @@ def _stamp_group(
                 # mixed output+reduction at one level), the mutated ranges are
                 # never observed: the RuntimeError propagates uncaught through
                 # the pass runner and aborts compilation.
-                _divide_reduction_ranges(op, count, [rpos] if rpos is not None else [])
+                _divide_reduction_ranges(
+                    op, count, [rpos] if rpos is not None else [], window=window
+                )
 
+        # Populate the sliding fields only when a level actually slides, so
+        # partition ops get a CoarseTileInfo byte-identical to before.
+        sliding_kwargs = (
+            {
+                "loop_slide_stride": op_slide_stride,
+                "loop_read_extent": op_read_extent,
+            }
+            if any(s is not None for s in op_slide_stride)
+            else {}
+        )
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
             loop_count=counts,
             loop_tiled_dims=op_tiled_dims,
             loop_tiled_reduction_dims=op_tiled_reduction_dims,
+            **sliding_kwargs,
         )
 
         logger.debug(
@@ -2147,6 +2181,7 @@ def _divide_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
     tiled_dims: list[int],
+    window: int | None = None,
 ) -> _RetiledBufferInfo | None:
     """Divide the specified iteration ranges of op by loop_count.
 
@@ -2156,6 +2191,13 @@ def _divide_ranges(
 
     ``tiled_dims`` is a list of positional indices into ``data.ranges``.
     All indices must be valid; an out-of-bounds index is a caller bug.
+
+    ``window`` (sliding-window tiling only): when set, each tiled dim's
+    per-iteration read range is set to this absolute ``window`` (the read
+    extent) instead of ``range // loop_count``.  The overlap — the base
+    advancing by less than ``window`` each iteration — is applied downstream in
+    the affine-stride codegen (it cannot be expressed by the range alone); here
+    we only size the per-iteration read.  ``None`` => ordinary partition tiling.
 
     Also updates ``op.layout.size``, ``op.layout.stride``, and
     ``op.layout.device_layout`` so the layout describes the smaller per-tile
@@ -2171,11 +2213,18 @@ def _divide_ranges(
     if not ranges:
         return None
 
+    # Original (full) sizes, captured before mutation — the sliding path needs
+    # them to reconstruct old_host_size (new * loop_count is wrong when the
+    # windows overlap).
+    orig_sizes = {i: ranges[i] for i in tiled_dims}
     for i in tiled_dims:
         assert 0 <= i < len(ranges), (
             f"coarse_tile: op {op.get_name()!r} tiled dim {i} out of bounds "
             f"(ranges has {len(ranges)} entries)"
         )
+        if window is not None:
+            ranges[i] = sympy.Integer(window)
+            continue
         r = ranges[i]
         if isinstance(r, (int, sympy.Integer)) and isinstance(
             loop_count, (int, sympy.Integer)
@@ -2242,7 +2291,11 @@ def _divide_ranges(
     # by multiplying tiled dims back up: old[i] = new[i] * loop_count.
     old_host_size = [int(s) for s in layout.size]
     for i in tiled_dims:
-        old_host_size[i] = int(new_size[i] * loop_count)
+        # Sliding: recover the real full size (windows overlap, so
+        # new * loop_count would overshoot); partition: new * loop_count.
+        old_host_size[i] = (
+            int(orig_sizes[i]) if window is not None else int(new_size[i] * loop_count)
+        )
     new_size_ints = [int(s) for s in new_size]
     # Recover the authoritative stick host dim from coordinate identity so
     # _resize_device_layout does not have to infer it by size (ambiguous for
@@ -2280,12 +2333,19 @@ def _divide_reduction_ranges(
     op: ComputedBuffer,
     loop_count: Expr,
     tiled_dims: list[int],
+    window: int | None = None,
 ) -> None:
     """Divide the specified reduction_ranges entries of op by loop_count.
 
     Unlike _divide_ranges, does NOT update op.layout.size/stride — the
     output buffer shape is determined by data.ranges (non-reduction dims)
     and is unchanged by reduction-dim tiling.
+
+    ``window`` (sliding-window tiling only): when set, each tiled reduction dim's
+    per-iteration extent is set to this absolute ``window`` (the read width)
+    instead of ``range // loop_count``.  The overlap is applied downstream in
+    the affine-stride codegen.  ``None`` => ordinary partition tiling.  No layout
+    update is needed here, so this is simpler than the _divide_ranges path.
     """
     data = op.data
     assert isinstance(data, Reduction)
@@ -2297,6 +2357,15 @@ def _divide_reduction_ranges(
             f"coarse_tile: op {op.get_name()!r} tiled reduction dim {i} out of bounds "
             f"(reduction_ranges has {len(reduction_ranges)} entries)"
         )
+        if window is not None:
+            print(  # SWA-DEBUG
+                f"SWA-DEBUG _divide_reduction_ranges: dim {i} "
+                f"range {reduction_ranges[i]} -> window {window} "
+                f"loop_count={loop_count}",
+                flush=True,
+            )
+            reduction_ranges[i] = sympy.Integer(window)
+            continue
         r = reduction_ranges[i]
         if isinstance(r, (int, sympy.Integer)) and isinstance(
             loop_count, (int, sympy.Integer)

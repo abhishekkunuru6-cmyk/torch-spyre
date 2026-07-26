@@ -50,12 +50,24 @@ class CoarseTileInfo:
         contains the ``data.reduction_ranges`` positional indices that are
         tiled at that level.  An empty sub-list means no reduction dim is
         tiled at that level.  Parallel to ``loop_tiled_dims``.
+    loop_slide_stride:
+        Sliding-window tiling only.  List (one entry per nesting level) of the
+        per-iteration base advance (block) for that level's tiled dim, or
+        ``None`` for ordinary partition tiling.  When set, the loop advances a
+        tiled input's base by this stride each iteration while it reads
+        ``loop_read_extent`` elements, so consecutive reads OVERLAP when
+        ``read_extent > slide_stride``.  Empty list => all levels partition.
+    loop_read_extent:
+        Parallel to ``loop_slide_stride``: the per-iteration read width
+        (window) for a sliding level, or ``None`` for partition tiling.
     """
 
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
+    loop_slide_stride: list[int | None] = field(default_factory=list)
+    loop_read_extent: list[int | None] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,14 @@ class DimHint:
     # None when op is broadcast w.r.t. this hint scope
     is_reduction: bool
     hint_id: int = 0  # the _hint_N counter value identifying the scope
+    # Sliding-window tiling (from sliding={"A": {"window": W, "stride": S}}).
+    # Both None => ordinary partition tiling (the default: read_extent == stride,
+    # tiles disjoint).  When set, each of the split_count iterations reads
+    # read_extent elements and advances its base by slide_stride, so
+    # consecutive reads OVERLAP when read_extent > slide_stride.  See
+    # docs/format/slide_impl_1.md "Prototype plan".
+    read_extent: int | None = None  # per-iteration read width (window)
+    slide_stride: int | None = None  # per-iteration base advance (block)
 
 
 # op.dim_hints: list[DimHint]

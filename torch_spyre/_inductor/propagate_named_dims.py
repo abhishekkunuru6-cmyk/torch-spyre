@@ -542,6 +542,71 @@ def propagate_named_dims(
         _enabled = False
 
 
+def _append_sliding_hints(
+    sliding: dict,
+    hint_id: int,
+    coord_for_name: dict,
+    reduction_dims: set,
+    dim_hints: list,
+) -> None:
+    """Turn a sliding={"A": {"window": W, "stride": S}} scope into DimHints.
+
+    ``split_count`` is the number of windows, ``(dim_size - W) // S + 1``.
+    ``read_extent`` (= W) and ``slide_stride`` (= S) carry the overlap.  The
+    dim must be declared (``declare_tensor_dim``) so its size is known.
+    """
+    if len(sliding) > 1:
+        raise NotImplementedError(
+            f"spyre_hint(sliding=...) specifies {len(sliding)} dimensions; "
+            "only one is currently allowed per spyre_hint() call."
+        )
+    for name, spec in sliding.items():
+        window = int(spec["window"])
+        stride = int(spec["stride"])
+        dim_size = _named_dims.get(name)
+        if dim_size is None:
+            raise ValueError(
+                f"spyre_hint(sliding=...) dim {name!r} is not a declared named "
+                "dim; call declare_tensor_dim() so its size is known."
+            )
+        if not (0 < window <= dim_size) or stride <= 0:
+            raise ValueError(
+                f"spyre_hint(sliding=...) on {name!r}: need 0 < window "
+                f"({window}) <= dim_size ({dim_size}) and stride ({stride}) > 0."
+            )
+        # PARTITION+SLIDE model (matches the numerically-correct probe #2):
+        # loop_count * read_extent must equal dim_size (a clean partition the
+        # reduction machinery understands), so the trip count is num_tiles =
+        # dim_size // window, NOT num_windows.  The overlap comes ONLY from the
+        # affine slide (slide_stride < window) applied in codegen; it does not
+        # change the trip count.  window must divide dim_size.
+        if dim_size % window != 0:
+            raise ValueError(
+                f"spyre_hint(sliding=...) on {name!r}: window ({window}) must "
+                f"divide dim_size ({dim_size}) for the partition+slide model."
+            )
+        num_tiles = dim_size // window
+        # SWA-DEBUG
+        print(
+            f"SWA-DEBUG sliding DimHint: name={name} split_count(num_tiles)="
+            f"{num_tiles} loop_var={coord_for_name.get(name)} read_extent={window} "
+            f"slide_stride={stride} is_reduction={name in reduction_dims} "
+            f"coord_for_name_keys={list(coord_for_name.keys())}",
+            flush=True,
+        )
+        dim_hints.append(
+            DimHint(
+                dim_names=[name],
+                split_count=num_tiles,
+                loop_var=coord_for_name.get(name),
+                is_reduction=name in reduction_dims,
+                hint_id=hint_id,
+                read_extent=window,
+                slide_stride=stride,
+            )
+        )
+
+
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:
     for op in operations:
         if not isinstance(op, ComputedBuffer):
@@ -551,6 +616,17 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             del op.work_div_loop_info  # type: ignore[attr-defined]
         dp = getattr(op, "_dim_prop_info", None)
         op_hints = get_op_hints(op) if dp and dp.loop_var_dims else {}
+        # SWA-DEBUG: trace where a sliding hint is lost.
+        _raw = get_op_hints(op)
+        if any("sliding" in h for h in _raw.values()):
+            print(
+                f"SWA-DEBUG op={op.get_operation_name()} HAS sliding annotation; "
+                f"dp={dp is not None} "
+                f"loop_var_dims={dict(dp.loop_var_dims) if dp else None} "
+                f"gate_passed={bool(op_hints)} "
+                f"reduction_named_dims={dp.reduction_named_dims if dp else None}",
+                flush=True,
+            )
         if not op_hints:
             op.dim_hints = []  # type: ignore[attr-defined]
             if dp is not None:
@@ -583,6 +659,24 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
 
         dim_hints = []
         for hint_id, hint_dict in sorted(op_hints.items()):
+            # Sliding-window tiling: sliding={"A": {"window": W, "stride": S}}.
+            # A separate shape from the count-based hints — it carries a window
+            # and a stride instead of a single split count, and yields a DimHint
+            # whose split_count is the number of windows and whose read_extent
+            # exceeds slide_stride (the overlap).  Opt-in; the count-based path
+            # below is unchanged for every existing hint.
+            sliding = hint_dict.get("sliding")
+            if "sliding" in hint_dict:  # SWA-DEBUG
+                print(
+                    f"SWA-DEBUG detect op={op.get_operation_name()} "
+                    f"hint_id={hint_id} sliding={sliding}",
+                    flush=True,
+                )
+            if sliding:
+                _append_sliding_hints(
+                    sliding, hint_id, coord_for_name, reduction_dims, dim_hints
+                )
+                continue
             # A hint scope uses exactly one of tiles/slices/num_tiles_per_dim.
             dims: dict[str, int] = next(
                 (
