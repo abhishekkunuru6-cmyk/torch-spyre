@@ -652,41 +652,61 @@ class SpyreKernel(Kernel[CSEVariable]):
                 if int(r) != 1
             )
 
-            def _level_sliding(
-                syms: list, extents: list, strides: list, lvl: int
-            ) -> None:
-                """Record (read_extent, slide_stride) for one level's symbols.
+            def _level_params(params: list, lvl: int, n_dims: int) -> list:
+                """This level's per-dim sliding params, padded to ``n_dims``.
 
-                Output-dim and reduction-dim symbols are recorded from their own
-                param lists, so a coupled level gives each dim the window and
-                stride that were hinted for IT — fanning one pair across every
-                symbol at the level would give the reduction dim the output
-                dim's slide.
+                The lists are parallel to the tiled-dim lists; padding covers
+                partition ops that carry no sliding fields at all.
                 """
-                extent = extents[lvl] if lvl < len(extents) else None
-                stride = strides[lvl] if lvl < len(strides) else None
-                if extent is None or stride is None:
-                    return
-                for s in syms:
-                    sliding_by_sym[s] = (extent, stride)
+                level = params[lvl] if lvl < len(params) else []
+                return list(level) + [None] * (n_dims - len(level))
+
+            def _record_sliding(syms: list, extents: list, strides: list) -> None:
+                """Record each symbol's OWN (read_extent, slide_stride).
+
+                Per dim, not per level: dims sharing a level can slide
+                differently (q @ kT partitions the score rows while sliding the
+                score columns), and a coupled level's reduction dim must not
+                inherit the output dim's window.  ``syms`` entries are
+                ``(symbol, dim_index)`` so a dim whose symbol could not be
+                resolved does not shift the params of the dims after it.
+                """
+                for sym, dim_idx in syms:
+                    extent, stride = extents[dim_idx], strides[dim_idx]
+                    if extent is not None and stride is not None:
+                        sliding_by_sym[sym] = (extent, stride)
 
             tiled_syms_per_level_outermost: list[list] = []
             for lvl in range(n_levels):
                 out_syms: list = []
                 if lvl < len(raw_tiled_dims):
-                    for d in raw_tiled_dims[lvl]:
+                    for j, d in enumerate(raw_tiled_dims[lvl]):
                         mapped = host_to_it.get(d)
                         if mapped is not None and mapped < len(it_space_keys):
-                            out_syms.append(it_space_keys[mapped])
+                            out_syms.append((it_space_keys[mapped], j))
                 red_syms: list = []
                 if lvl < len(raw_tiled_red_dims):
-                    for r in raw_tiled_red_dims[lvl]:
+                    for j, r in enumerate(raw_tiled_red_dims[lvl]):
                         sym_idx = n_output_it_syms + r
                         if sym_idx < len(it_space_keys):
-                            red_syms.append(it_space_keys[sym_idx])
-                tiled_syms_per_level_outermost.append(out_syms + red_syms)
-                _level_sliding(out_syms, raw_read_extent, raw_slide_stride, lvl)
-                _level_sliding(red_syms, raw_red_read_extent, raw_red_slide_stride, lvl)
+                            red_syms.append((it_space_keys[sym_idx], j))
+                tiled_syms_per_level_outermost.append(
+                    [s for s, _ in out_syms] + [s for s, _ in red_syms]
+                )
+                n_out = len(raw_tiled_dims[lvl]) if lvl < len(raw_tiled_dims) else 0
+                n_red = (
+                    len(raw_tiled_red_dims[lvl]) if lvl < len(raw_tiled_red_dims) else 0
+                )
+                _record_sliding(
+                    out_syms,
+                    _level_params(raw_read_extent, lvl, n_out),
+                    _level_params(raw_slide_stride, lvl, n_out),
+                )
+                _record_sliding(
+                    red_syms,
+                    _level_params(raw_red_read_extent, lvl, n_red),
+                    _level_params(raw_red_slide_stride, lvl, n_red),
+                )
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
 

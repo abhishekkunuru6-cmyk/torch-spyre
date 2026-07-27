@@ -15,16 +15,18 @@
 """Unit tests for COUPLED sliding hints — the causal-diagonal cross-dim slide.
 
 A multi-entry ``spyre_hint(sliding={...})`` couples several named dims under
-one loop level, each with its own window/stride: sliding-window attention needs
-one loop var to partition-slide the Q rows while it overlap-slides the KV
-window.  These tests cover the three places that had to learn about coupling:
+one loop level, each with its own window/stride.  Sliding-window attention needs
+two flavours of that: ``exp @ v`` pairs a partition-slid output dim with an
+overlap-slid REDUCTION dim, while ``q @ kT`` pairs two OUTPUT dims (score rows
+partition, score columns slide).  These tests cover the places that had to learn
+about coupling:
 
   1. hint parsing/validation (``_append_sliding_hints``,
      ``_validate_coupled_sliding``)
   2. the mixed output+reduction level gate (``_is_coupled_sliding_level``,
      ``_validate_reduction_tiling``)
-  3. full-range reconstruction for a sliding output dim
-     (``_compute_full_ranges``)
+  3. full-range reconstruction and the overlapping-write guard for a sliding
+     output dim (``_compute_full_ranges``)
 
 No Spyre device or backend compiler is required.
 """
@@ -88,16 +90,14 @@ class TestValidateCoupledSliding(unittest.TestCase):
             _validate_coupled_sliding(specs, coords, {"KV"})
         self.assertIn("share a trip count", str(cm.exception))
 
-    def test_two_output_dims_raise(self):
-        """coarse_tile resolves one output-range position per hint_id."""
+    def test_two_output_dims_ok(self):
+        """q @ kT slides the score rows and columns — both output dims."""
         specs = [
             _spec("QS", Q_BLOCK, Q_BLOCK, NUM_TILES, QSEQ),
             _spec("KV", KV_WINDOW, KV_STRIDE, NUM_TILES, KVSEQ),
         ]
         coords = {"QS": sympy.Symbol("c0"), "KV": sympy.Symbol("c1")}
-        with self.assertRaises(NotImplementedError) as cm:
-            _validate_coupled_sliding(specs, coords, set())
-        self.assertIn("output dims", str(cm.exception))
+        _validate_coupled_sliding(specs, coords, set())
 
     def test_two_reduction_dims_raise(self):
         specs = [
@@ -215,10 +215,26 @@ def _coupled_loop_info():
         loop_count=[Integer(NUM_TILES)],
         loop_tiled_dims=[[0]],
         loop_tiled_reduction_dims=[[0]],
-        loop_slide_stride=[Q_BLOCK],
-        loop_read_extent=[Q_BLOCK],
-        loop_reduction_slide_stride=[KV_STRIDE],
-        loop_reduction_read_extent=[KV_WINDOW],
+        loop_slide_stride=[[Q_BLOCK]],
+        loop_read_extent=[[Q_BLOCK]],
+        loop_reduction_slide_stride=[[KV_STRIDE]],
+        loop_reduction_read_extent=[[KV_WINDOW]],
+    )
+
+
+def _two_output_dims_loop_info():
+    """One level tiling TWO output dims: dim 0 partitions, dim 1 overlaps.
+
+    The `q @ kT` shape — score rows partition by q_block while score columns
+    slide by KV_STRIDE with a KV_WINDOW read.
+    """
+    return CoarseTileInfo(
+        loop_group_id=(0,),
+        loop_count=[Integer(NUM_TILES)],
+        loop_tiled_dims=[[0, 1]],
+        loop_tiled_reduction_dims=[[]],
+        loop_slide_stride=[[Q_BLOCK, KV_STRIDE]],
+        loop_read_extent=[[Q_BLOCK, KV_WINDOW]],
     )
 
 
@@ -234,10 +250,14 @@ class TestIsCoupledSlidingLevel(unittest.TestCase):
             loop_count=[Integer(NUM_TILES)],
             loop_tiled_dims=[[]],
             loop_tiled_reduction_dims=[[0]],
-            loop_reduction_slide_stride=[KV_STRIDE],
-            loop_reduction_read_extent=[KV_WINDOW],
+            loop_reduction_slide_stride=[[KV_STRIDE]],
+            loop_reduction_read_extent=[[KV_WINDOW]],
         )
         self.assertFalse(_is_coupled_sliding_level(info, 0))
+
+    def test_two_output_dims_is_not_coupled(self):
+        """Coupled means output AND reduction; two output dims is not that."""
+        self.assertFalse(_is_coupled_sliding_level(_two_output_dims_loop_info(), 0))
 
     def test_partition_level_is_not_coupled(self):
         info = CoarseTileInfo(
@@ -277,13 +297,20 @@ class TestComputeFullRangesSlidingOutput(unittest.TestCase):
         full = _compute_full_ranges(_reduction_op(_coupled_loop_info()))
         self.assertEqual(int(full[0]), QSEQ)
 
-    def test_overlapping_output_slide_raises(self):
-        """Overlapping output tiles span less than tile*count; reject, don't mis-size."""
+    def test_unseparated_overlapping_output_slide_raises(self):
+        """With nothing partitioning alongside, overlapping tiles double-write."""
         info = _coupled_loop_info()
-        info.loop_slide_stride = [Q_BLOCK // 2]
+        info.loop_slide_stride = [[Q_BLOCK // 2]]
         with self.assertRaises(NotImplementedError) as cm:
             _compute_full_ranges(_reduction_op(info))
-        self.assertIn("OUTPUT dim", str(cm.exception))
+        self.assertIn("OUTPUT", str(cm.exception))
+
+    def test_overlapping_output_slide_ok_when_partition_separates(self):
+        """q @ kT: the partitioning row dim keeps the written regions disjoint."""
+        op = _reduction_op(_two_output_dims_loop_info())
+        op.data.ranges = [Integer(Q_BLOCK), Integer(KV_WINDOW)]
+        full = _compute_full_ranges(op)
+        self.assertEqual([int(r) for r in full], [QSEQ, KVSEQ])
 
 
 if __name__ == "__main__":

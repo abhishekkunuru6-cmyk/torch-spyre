@@ -280,6 +280,45 @@ def _loop_var_to_ranges_pos(out_coords: list, sym: sympy.Symbol) -> int | None:
     return None
 
 
+# (range position, read_extent, slide_stride) for one tiled dim.  The extents
+# are None for ordinary partition tiling.
+_TiledDim = tuple[int, "int | None", "int | None"]
+
+
+def _tiled_dims_by_hint(
+    op: ComputedBuffer,
+) -> tuple[dict[int, list[_TiledDim]], dict[int, list[_TiledDim]]]:
+    """Resolve ``op``'s DimHints to (output, reduction) tiled dims per hint_id.
+
+    Returns two maps, ``hint_id -> [(pos, read_extent, slide_stride), ...]``,
+    the first indexing ``data.ranges`` and the second
+    ``data.reduction_ranges``.  A hint_id maps to a LIST because one hint scope
+    can name several dims that share its loop level, each with its own
+    window/stride — the coupled slide.  Hints whose loop var this op does not
+    iterate (broadcast) and dims whose position cannot be resolved are omitted,
+    leaving the op loop-invariant at that level.
+    """
+    op_out = op_out_coords(op)
+    is_reduction_op = isinstance(op.data, Reduction)
+    out_dims: dict[int, list[_TiledDim]] = {}
+    red_dims: dict[int, list[_TiledDim]] = {}
+    for h in getattr(op, "dim_hints", []):
+        if h.loop_var is None:
+            continue
+        if h.is_reduction:
+            if not is_reduction_op:
+                continue
+            pos = _loop_var_to_reduction_ranges_pos(op, h.loop_var)
+            by_kind = red_dims
+        else:
+            pos = _loop_var_to_ranges_pos(op_out, h.loop_var)
+            by_kind = out_dims
+        if pos is None:
+            continue
+        by_kind.setdefault(h.hint_id, []).append((pos, h.read_extent, h.slide_stride))
+    return out_dims, red_dims
+
+
 def _hints_levels(ops: list[Operation]) -> list[tuple]:
     """Build (hint_id, K) level pairs by unioning across all ops.
 
@@ -1121,14 +1160,16 @@ def _is_coupled_sliding_level(loop_info, level: int) -> bool:
     """
     if loop_info is None:
         return False
-    out_extent = getattr(loop_info, "loop_read_extent", [])
-    red_extent = getattr(loop_info, "loop_reduction_read_extent", [])
-    return (
-        level < len(out_extent)
-        and out_extent[level] is not None
-        and level < len(red_extent)
-        and red_extent[level] is not None
-    )
+    return _slides_at_level(
+        getattr(loop_info, "loop_read_extent", []), level
+    ) and _slides_at_level(getattr(loop_info, "loop_reduction_read_extent", []), level)
+
+
+def _slides_at_level(per_level_extents: list, level: int) -> bool:
+    """True if any dim at ``level`` carries a sliding read extent."""
+    if level >= len(per_level_extents):
+        return False
+    return any(e is not None for e in per_level_extents[level])
 
 
 def _validate_reduction_tiling(op: ComputedBuffer) -> None:
@@ -1360,19 +1401,20 @@ def _compute_full_ranges(op: ComputedBuffer) -> list[Expr]:
     op.data.ranges holds the already-divided ranges.  Reconstruct the full
     ranges by multiplying each tiled dimension back by its loop_count.
 
-    That reconstruction assumes the tiles PARTITION the dim (span ==
-    tile * count), which a sliding output dim satisfies only when it does not
-    overlap (slide_stride == read_extent).  An overlapping output dim writes a
-    span of slide_stride * (count - 1) + read_extent, strictly less than
-    tile * count.
+    Reconstructing a dim as ``tile * count`` is exact for partition tiling and
+    for a sliding dim whose windows tile cleanly (``count * read_extent`` is the
+    declared dim size — the partition+slide model requires ``window | dim_size``).
+    An OVERLAPPING output dim writes only
+    ``slide_stride * (count - 1) + read_extent``, so ``tile * count`` allocates
+    a buffer larger than the written span, with an unwritten tail.
 
-    Whether the overlap is SAFE depends on the rest of the level.  When another
-    output dim partitions alongside it (SWA's Q-block rows paired with sliding
-    KV score columns), consecutive tiles land on disjoint rows and the
-    overlapping column ranges never collide; when nothing separates them,
-    consecutive iterations genuinely write the same elements.  Distinguishing
-    the two needs the two-output-dims-per-level support that is not built yet,
-    so both are rejected here rather than silently mis-sized.
+    That over-allocation is harmless; overlapping WRITES would not be.  They are
+    only avoided when some other output dim at the same level partitions, so
+    consecutive tiles land on disjoint slices of it (SWA's `q @ kT`: Q-block
+    rows partition while the score columns slide, making the 2D regions
+    disjoint even though the column ranges overlap).  With nothing to separate
+    them, consecutive iterations genuinely write the same elements — rejected
+    here rather than silently corrupting the output.
     """
     full_ranges = list(op.data.ranges)
     loop_info = op.loop_info
@@ -1381,21 +1423,48 @@ def _compute_full_ranges(op: ComputedBuffer) -> list[Expr]:
     read_extent: list = getattr(loop_info, "loop_read_extent", [])
     slide_stride: list = getattr(loop_info, "loop_slide_stride", [])
     for lvl, (count, dims) in enumerate(zip(loop_count, loop_tiled_dims)):
-        if dims and lvl < len(read_extent) and read_extent[lvl] is not None:
-            if slide_stride[lvl] != read_extent[lvl]:
-                raise NotImplementedError(
-                    f"coarse_tile: op {op.get_name()!r} level {lvl} slides "
-                    f"OUTPUT dim(s) {dims} with overlap (stride "
-                    f"{slide_stride[lvl]} != window {read_extent[lvl]}), so "
-                    "the written span is smaller than tile * count.  Sliding "
-                    "an output dim is only supported as a clean partition "
-                    "(stride == window) until a second partitioning output dim "
-                    "at the same level can be expressed."
-                )
+        _validate_output_slide_overlap(op, lvl, dims, read_extent, slide_stride)
         for d in dims:
             if 0 <= d < len(full_ranges):
                 full_ranges[d] = sympy.simplify(full_ranges[d] * count)
     return full_ranges
+
+
+def _validate_output_slide_overlap(
+    op: ComputedBuffer,
+    level: int,
+    dims: list[int],
+    read_extent: list,
+    slide_stride: list,
+) -> None:
+    """Reject an overlapping output slide that nothing separates.
+
+    See ``_compute_full_ranges``: an overlapping output dim is safe only when a
+    partitioning output dim shares its level and keeps the written regions
+    disjoint.
+    """
+    if not dims or level >= len(read_extent) or level >= len(slide_stride):
+        return
+    extents = read_extent[level]
+    strides = slide_stride[level]
+    overlapping = [
+        pos
+        for pos, extent, stride in zip(dims, extents, strides)
+        if extent is not None and stride is not None and stride != extent
+    ]
+    if not overlapping:
+        return
+    partitioning = any(
+        extent is None or stride == extent for extent, stride in zip(extents, strides)
+    )
+    if partitioning:
+        return
+    raise NotImplementedError(
+        f"coarse_tile: op {op.get_name()!r} level {level} slides OUTPUT "
+        f"dim(s) {overlapping} with overlap and has no partitioning output dim "
+        "at that level to keep the written regions disjoint, so consecutive "
+        "iterations would write the same elements."
+    )
 
 
 def _allocate_full_buffer(
@@ -2093,16 +2162,18 @@ def _stamp_group(
     """Stamp loop_group_id / loop_count / loop_tiled_dims and divide ranges.
 
     ``levels`` is a list of ``(hint_id, count)`` pairs, outermost first.  Each
-    op resolves its own tiled dimension from its loop_var in dim_hints.  Ops
-    that have no matching dim for a level are loop-invariant at that level.
+    op resolves its own tiled dimensions from its loop_vars in dim_hints (see
+    ``_tiled_dims_by_hint``).  Ops that have no matching dim for a level are
+    loop-invariant at that level.
 
-    For each (op, hint_id) pair the dispatch is per-op:
-    - If hint_id is in hint_id_to_ranges_pos (output dim for this op):
-      populate loop_tiled_dims and call _divide_ranges.
-    - If hint_id is in hint_id_to_reduction_ranges_pos (reduction dim for this
-      op): populate loop_tiled_reduction_dims and call _divide_reduction_ranges.
-    - These are mutually exclusive per op (enforced by _validate_reduction_tiling).
-    - If hint_id is in neither (broadcast op): both lists get [] for this level.
+    Per (op, hint_id), each resolved dim is dispatched by kind:
+    - Output dims populate loop_tiled_dims and get a _divide_ranges call.
+    - Reduction dims populate loop_tiled_reduction_dims and get a
+      _divide_reduction_ranges call.
+    - A level may hold several dims of either kind, each with its own
+      window/stride; mixing the two kinds at one level is restricted by
+      _validate_reduction_tiling.
+    - A hint_id matching no dim (broadcast op) leaves both lists empty.
 
     End-to-end correctness of the reduction path is covered by
     TestCoarseTileReductionDim0E2E in tests/inductor/test_coarse_tile_e2e.py.
@@ -2125,81 +2196,44 @@ def _stamp_group(
             )
             continue
 
-        op_out = op_out_coords(op)
-
-        # Build lookup: hint_id → output-ranges position (non-reduction dims).
-        hint_id_to_ranges_pos: dict[int, int] = {
-            h.hint_id: pos
-            for h in getattr(op, "dim_hints", [])
-            if h.loop_var is not None and not h.is_reduction
-            if (pos := _loop_var_to_ranges_pos(op_out, h.loop_var)) is not None
-        }
-
-        # Build lookup: hint_id → reduction_ranges position (reduction dims).
-        hint_id_to_reduction_ranges_pos: dict[int, int] = {}
-        if isinstance(op.data, Reduction):
-            hint_id_to_reduction_ranges_pos = {
-                h.hint_id: pos
-                for h in getattr(op, "dim_hints", [])
-                if h.loop_var is not None and h.is_reduction
-                if (pos := _loop_var_to_reduction_ranges_pos(op, h.loop_var))
-                is not None
-            }
-
-        # Build lookups: hint_id → (read_extent, slide_stride) for sliding-window
-        # tiling, kept separate per dim kind.  A COUPLED hint scope names an
-        # output dim and a reduction dim under one hint_id with DIFFERENT
-        # window/stride (the causal diagonal), so a single hint_id → params map
-        # would silently drop one of them.  Absent for ordinary partition hints
-        # (read_extent is None).
-        hint_id_to_sliding_out: dict[int, tuple[int, int]] = {}
-        hint_id_to_sliding_red: dict[int, tuple[int, int]] = {}
-        for h in getattr(op, "dim_hints", []):
-            if h.read_extent is None or h.slide_stride is None:
-                continue
-            by_kind = (
-                hint_id_to_sliding_red if h.is_reduction else hint_id_to_sliding_out
-            )
-            by_kind[h.hint_id] = (h.read_extent, h.slide_stride)
+        out_dims_by_hint, red_dims_by_hint = _tiled_dims_by_hint(op)
 
         op_tiled_dims: list[list[int]] = []
         op_tiled_reduction_dims: list[list[int]] = []
-        op_slide_stride: list[int | None] = []
-        op_read_extent: list[int | None] = []
-        op_red_slide_stride: list[int | None] = []
-        op_red_read_extent: list[int | None] = []
+        op_slide_stride: list[list[int | None]] = []
+        op_read_extent: list[list[int | None]] = []
+        op_red_slide_stride: list[list[int | None]] = []
+        op_red_read_extent: list[list[int | None]] = []
         for hint_id, count in levels:
-            opos = hint_id_to_ranges_pos.get(hint_id)
-            rpos = hint_id_to_reduction_ranges_pos.get(hint_id)
-            sliding_out = hint_id_to_sliding_out.get(hint_id)
-            sliding_red = hint_id_to_sliding_red.get(hint_id)
-            window = sliding_out[0] if sliding_out is not None else None
-            red_window = sliding_red[0] if sliding_red is not None else None
-            op_tiled_dims.append([opos] if opos is not None else [])
-            op_tiled_reduction_dims.append([rpos] if rpos is not None else [])
-            op_slide_stride.append(sliding_out[1] if sliding_out is not None else None)
-            op_read_extent.append(window)
-            op_red_slide_stride.append(
-                sliding_red[1] if sliding_red is not None else None
-            )
-            op_red_read_extent.append(red_window)
-            # _divide_ranges with tiled_dims=[] is a no-op.  For a sliding level
-            # `window` sizes the per-iteration read; the overlap comes downstream
-            # (the affine-stride scaling).  Note: for overlapping windows
-            # count * window != original range (windows overlap by design), so
-            # the `window` path deliberately bypasses the partition divisibility
-            # check in _divide_ranges / _divide_reduction_ranges.
-            retiled_info = _divide_ranges(
-                op, count, [opos] if opos is not None else [], window=window
-            )
-            if retiled_info is not None:
-                name = op.get_name()
-                prior = retiled_infos.get(name)
-                retiled_infos[name] = (
-                    _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
-                    if prior is not None
-                    else retiled_info
-                )
+            out_entries = out_dims_by_hint.get(hint_id, [])
+            red_entries = red_dims_by_hint.get(hint_id, [])
+            op_tiled_dims.append([pos for pos, _e, _s in out_entries])
+            op_tiled_reduction_dims.append([pos for pos, _e, _s in red_entries])
+            op_slide_stride.append([s for _p, _e, s in out_entries])
+            op_read_extent.append([e for _p, e, _s in out_entries])
+            op_red_slide_stride.append([s for _p, _e, s in red_entries])
+            op_red_read_extent.append([e for _p, e, _s in red_entries])
+            # One _divide_ranges call per tiled dim: dims sharing a level can
+            # carry DIFFERENT windows (q @ kT partitions the score rows by 64
+            # while sliding the score columns by W), and _divide_ranges takes a
+            # single window for all the dims it is handed.
+            #
+            # For a sliding dim `window` sizes the per-iteration read; the
+            # overlap comes downstream (the affine-stride scaling).  Note: for
+            # overlapping windows count * window != original range (windows
+            # overlap by design), so the `window` path deliberately bypasses the
+            # partition divisibility check in _divide_ranges /
+            # _divide_reduction_ranges.
+            for pos, extent, _stride in out_entries:
+                retiled_info = _divide_ranges(op, count, [pos], window=extent)
+                if retiled_info is not None:
+                    name = op.get_name()
+                    prior = retiled_infos.get(name)
+                    retiled_infos[name] = (
+                        _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
+                        if prior is not None
+                        else retiled_info
+                    )
             if isinstance(op.data, Reduction):
                 # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
                 # before _validate_reduction_tiling runs in the later
@@ -2207,17 +2241,16 @@ def _stamp_group(
                 # mixed output+reduction at one level), the mutated ranges are
                 # never observed: the RuntimeError propagates uncaught through
                 # the pass runner and aborts compilation.
-                _divide_reduction_ranges(
-                    op, count, [rpos] if rpos is not None else [], window=red_window
-                )
+                for pos, extent, _stride in red_entries:
+                    _divide_reduction_ranges(op, count, [pos], window=extent)
 
         # Populate the sliding fields only when a level actually slides, so
         # partition ops get a CoarseTileInfo byte-identical to before.
-        sliding_kwargs: dict[str, list[int | None]] = {}
-        if any(s is not None for s in op_slide_stride):
+        sliding_kwargs: dict[str, list[list[int | None]]] = {}
+        if any(s is not None for level in op_slide_stride for s in level):
             sliding_kwargs["loop_slide_stride"] = op_slide_stride
             sliding_kwargs["loop_read_extent"] = op_read_extent
-        if any(s is not None for s in op_red_slide_stride):
+        if any(s is not None for level in op_red_slide_stride for s in level):
             sliding_kwargs["loop_reduction_slide_stride"] = op_red_slide_stride
             sliding_kwargs["loop_reduction_read_extent"] = op_red_read_extent
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]

@@ -643,23 +643,21 @@ def _validate_coupled_sliding(
             + ".  Pick windows so every coupled dim yields the same tile count."
         )
 
-    # coarse_tile resolves a hint_id to at most one output-range position and
-    # one reduction-range position per op, so two coupled dims that land on the
-    # same side for the same op would silently drop one.  Only dims this op
-    # actually iterates (loop_var resolved) can collide.
-    resolved = [
-        (name, name in reduction_dims)
+    # Several OUTPUT dims may share a level (SWA's q @ kT slides the score rows
+    # and the score columns together), but coarse_tile still tiles at most one
+    # REDUCTION range position per level — see _validate_reduction_tiling.  Only
+    # dims this op actually iterates (loop_var resolved) count.
+    coupled_reductions = [
+        name
         for name, *_ in specs
-        if coord_for_name.get(name) is not None
+        if name in reduction_dims and coord_for_name.get(name) is not None
     ]
-    for is_reduction, kind in ((False, "output"), (True, "reduction")):
-        clashing = [name for name, red in resolved if red == is_reduction]
-        if len(clashing) > 1:
-            raise NotImplementedError(
-                f"spyre_hint(sliding=...) couples {len(clashing)} {kind} dims "
-                f"({', '.join(clashing)}) in one scope; a coupled scope supports "
-                "at most one output dim and one reduction dim per op."
-            )
+    if len(coupled_reductions) > 1:
+        raise NotImplementedError(
+            f"spyre_hint(sliding=...) couples {len(coupled_reductions)} reduction "
+            f"dims ({', '.join(coupled_reductions)}) in one scope; a level can "
+            "tile at most one reduction dim."
+        )
 
 
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:
