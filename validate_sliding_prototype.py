@@ -33,13 +33,20 @@ mutating MLIR.  A reduction (not a pointwise op) is required so the input read
 stride and the output accumulator stride genuinely differ.
 
 SENCORES=1 keeps it single-core (no work-division to debug simultaneously).
-D, W, S are chosen so (D - W) % S == 0 (windows tile the dim) and W | D (clean
-single-core layout): D=256, W=128, S=64 -> 3 windows overlapping by 64.
+
+Shape constraints (frontend today):
+  * WINDOW | ROWS      — split_count = ROWS // WINDOW, so the window must divide
+                         the reduction dim evenly.
+  * COLS % 64 == 0     — COLS spans whole 64-element sticks (COLS // 64 sticks).
+  * STRIDE < WINDOW    — otherwise there is no overlap (plain partition).
 
 Run:
-    python3 validate_sliding_prototype.py
+    python3 validate_sliding_prototype.py                    # default single shape
+    python3 validate_sliding_prototype.py --rows 512 --cols 192 --window 128 --stride 64
+    python3 validate_sliding_prototype.py --sweep            # shape-hardening sweep
 """
 
+import argparse
 import os
 
 os.environ.setdefault("SENCORES", "1")
@@ -51,15 +58,28 @@ from torch._inductor.runtime.runtime_utils import cache_dir  # noqa: E402
 
 DEVICE = torch.device("spyre")
 BUNDLE_ROOT = os.path.join(cache_dir(), "inductor-spyre")
+STICK = 64  # elements per stick at fp16
 
-ROWS = 256  # dim "A" — the reduction dim, slid over
-# COLS = 64 => a SINGLE 64-element stick (isolate the sliding mechanism from the
-# multi-stick addressing bug: with COLS=128 = 2 sticks, stick0 is numerically
-# correct but stick1 is wrong — the slide isn't propagating to the 2nd col-stick).
-# Set back to 128 to reproduce the multi-stick failure.
-COLS = 128  # dim "B" — 2 col-sticks (multi-stick addressing investigation)
-WINDOW = 128  # W
-STRIDE = 64  # S  (< W => overlap of 64)
+# Defaults (overridable via CLI).  ROWS=256, WINDOW=128, STRIDE=64, COLS=128 is
+# the 2-col-stick multi-stick case: 2 windows x[0:128] + x[64:192], overlap 64.
+DEFAULT_ROWS = 256
+DEFAULT_COLS = 128
+DEFAULT_WINDOW = 128
+DEFAULT_STRIDE = 64
+
+# Shape-hardening sweep: exercises >2 sticks, more windows, and W!=2*S.  Every
+# entry obeys WINDOW | ROWS and COLS % 64 == 0.
+SWEEP_SHAPES = [
+    # (rows, cols, window, stride)   note
+    (256, 64, 128, 64),  # 1 stick, 2 windows  (single-stick baseline)
+    (256, 128, 128, 64),  # 2 sticks, 2 windows (the fixed multi-stick case)
+    (256, 192, 128, 64),  # 3 sticks
+    (256, 256, 128, 64),  # 4 sticks
+    (512, 128, 128, 64),  # 2 sticks, 4 windows (more loop iterations)
+    (384, 128, 128, 64),  # 3 windows
+    (512, 128, 256, 128),  # 2 tiles, larger window W=256 S=128 (overlap 128)
+    (512, 192, 256, 64),  # 3 sticks, 2 tiles, W=256 S=64 (overlap 192)
+]
 
 _AFFINE_MAP = re.compile(r"#map_\d+ = affine_map")
 
@@ -68,7 +88,9 @@ def _snapshot() -> set[str]:
     return set(os.listdir(BUNDLE_ROOT)) if os.path.isdir(BUNDLE_ROOT) else set()
 
 
-def _cpu_overlap_reference(x: torch.Tensor) -> torch.Tensor:
+def _cpu_overlap_reference(
+    x: torch.Tensor, rows: int, cols: int, window: int, stride: int
+) -> torch.Tensor:
     """The coverage-weighted sum the sliding reduction should produce.
 
     PARTITION+SLIDE model: loop_count = num_tiles = ROWS // WINDOW (so
@@ -76,11 +98,11 @@ def _cpu_overlap_reference(x: torch.Tensor) -> torch.Tensor:
     The overlap comes from slide (STRIDE) < read (WINDOW).  With W=128, S=64,
     ROWS=256 this is 2 windows: x[0:128] + x[64:192] (covers rows 0-191).
     """
-    num_tiles = ROWS // WINDOW
-    acc = torch.zeros(COLS, dtype=torch.float32)
+    num_tiles = rows // window
+    acc = torch.zeros(cols, dtype=torch.float32)
     for i in range(num_tiles):
-        lo = STRIDE * i
-        acc += x[lo : lo + WINDOW].to(torch.float32).sum(dim=0)
+        lo = stride * i
+        acc += x[lo : lo + window].to(torch.float32).sum(dim=0)
     return acc
 
 
@@ -134,15 +156,24 @@ def _dump_affine_maps(new_dirs: set[str]) -> None:
                 print(f"        {pth} = {val}")
 
 
-def main() -> None:
-    torch.manual_seed(0xAFFE)
-    print(f"SENCORES={os.environ.get('SENCORES')}")
-    print(
-        f"D={ROWS} W={WINDOW} S={STRIDE} -> "
-        f"{ROWS // WINDOW} tiles (partition+slide), overlap {WINDOW - STRIDE}"
-    )
-    print("=" * 78)
+def run_one(rows: int, cols: int, window: int, stride: int, dump: bool = True) -> bool:
+    """Compile x.sum(dim=0) with a sliding hint and check numerics on HW.
 
+    Returns True when the compiled output matches the coverage-weighted overlap
+    reference.  Prints a per-stick error breakdown so a partial failure (some
+    sticks right, some wrong) is immediately visible.
+    """
+    assert rows % window == 0, f"WINDOW {window} must divide ROWS {rows}"
+    assert cols % STICK == 0, f"COLS {cols} must be a multiple of {STICK}"
+    n_sticks = cols // STICK
+    print("=" * 78)
+    print(
+        f"SENCORES={os.environ.get('SENCORES')}  "
+        f"D={rows} COLS={cols} ({n_sticks} stick(s)) W={window} S={stride} -> "
+        f"{rows // window} tiles (partition+slide), overlap {window - stride}"
+    )
+
+    torch.manual_seed(0xAFFE)
     from torch_spyre._inductor import config, spyre_hint
     import torch_spyre._inductor.propagate_named_dims as _pnd
 
@@ -150,15 +181,15 @@ def main() -> None:
     torch._dynamo.reset_code_caches()
     torch._inductor.codecache.FxGraphCache.clear()
 
-    x = torch.randn(ROWS, COLS, dtype=torch.float16)
+    x = torch.randn(rows, cols, dtype=torch.float16)
 
     def fn(x):
-        with spyre_hint(sliding={"A": {"window": WINDOW, "stride": STRIDE}}):
+        with spyre_hint(sliding={"A": {"window": window, "stride": stride}}):
             return x.sum(dim=0)
 
     x_dev = x.to(DEVICE)
-    _pnd.declare_tensor_dim("A", ROWS)
-    _pnd.declare_tensor_dim("B", COLS)
+    _pnd.declare_tensor_dim("A", rows)
+    _pnd.declare_tensor_dim("B", cols)
     _pnd.name_tensor_dims(x_dev, ["A", "B"])
 
     before = _snapshot()
@@ -166,55 +197,22 @@ def main() -> None:
         with config.patch({"lx_planning": True, "allow_all_ops_in_lx_planning": True}):
             got = torch.compile(fn)(x_dev).to("cpu", torch.float32)
     except Exception as e:  # noqa: BLE001 — surface compile/codegen failures
-        print(f"COMPILE/RUN FAILED: {type(e).__name__}: {e}")
-        print("Bundles emitted before the failure:")
+        print(f"  COMPILE/RUN FAILED: {type(e).__name__}: {e}")
+        if dump:
+            _dump_affine_maps(_snapshot() - before)
+        return False
+
+    if dump:
         _dump_affine_maps(_snapshot() - before)
-        raise
 
-    print("bundle(s) emitted:")
-    _dump_affine_maps(_snapshot() - before)
-
-    ref = _cpu_overlap_reference(x)
+    ref = _cpu_overlap_reference(x, rows, cols, window, stride)
     full = x.to(torch.float32).sum(dim=0)  # what a NON-overlapping read gives
     max_err = (got - ref).abs().max().item()
     ok = torch.allclose(got, ref, rtol=2e-2, atol=ref.abs().max().item() * 2e-2)
 
-    # Reverse-engineer what the kernel ACTUALLY computed: try candidate
-    # (num_iters, read_width, slide_stride) geometries and report which matches.
-    def _candidate(n_iters, width, stride):
-        acc = torch.zeros(COLS, dtype=torch.float32)
-        for i in range(n_iters):
-            lo = stride * i
-            hi = min(lo + width, ROWS)
-            if lo < ROWS:
-                acc += x[lo:hi].to(torch.float32).sum(dim=0)
-        return acc
-
-    print("  reverse-engineering the compiled output (n_iters, width, stride):")
-    for ni, w, s in [
-        (3, 128, 64),
-        (2, 128, 64),
-        (3, 64, 64),
-        (2, 128, 128),
-        (3, 128, 128),
-        (3, 256, 64),
-        (4, 64, 64),
-        (2, 128, 32),
-        (3, 128, 32),
-    ]:
-        cand = _candidate(ni, w, s)
-        match = torch.allclose(
-            got, cand, rtol=2e-2, atol=cand.abs().max().item() * 2e-2 + 1e-3
-        )
-        print(
-            f"    ({ni:>2}, w={w:>3}, s={s:>3}) peak={cand.abs().max().item():>7.3f}"
-            f"{'   <== MATCH' if match else ''}"
-        )
-
     # Peak-matches-but-element-wise-mismatch is the signature of a COLUMN-ORDERING
-    # (stick-layout) difference between the device output and the natural-order CPU
-    # reference: the values can be correct but permuted.  Compare the sorted vectors
-    # to tell "right values, reordered" (permutation) from "wrong values".
+    # (stick-layout) difference: values correct but permuted.  Compare sorted
+    # vectors to tell "right values, reordered" from "wrong values".
     sorted_match = torch.allclose(
         got.sort().values,
         ref.sort().values,
@@ -222,57 +220,72 @@ def main() -> None:
         atol=ref.abs().max().item() * 2e-2,
     )
 
-    print()
-    print(f"  overlap reference peak: {ref.abs().max().item():.3f}")
     print(
-        f"  plain full-sum   peak: {full.abs().max().item():.3f} "
-        "(what NO overlap would give)"
+        f"  overlap ref peak: {ref.abs().max().item():.3f}  "
+        f"full-sum peak: {full.abs().max().item():.3f}  "
+        f"got peak: {got.abs().max().item():.3f}"
     )
-    print(f"  compiled output   peak: {got.abs().max().item():.3f}")
     print(
         f"  max|got - overlap_ref| = {max_err:.4f} -> {'MATCH' if ok else 'MISMATCH'}"
+        f"   permutation={bool(sorted_match)}"
     )
-    print(
-        f"  PERMUTATION TEST (sorted got vs sorted overlap_ref): {bool(sorted_match)}"
-    )
-    # Per-column error localisation.  128 output cols = 2 sticks of 64; if the
-    # slide works for stick 0 but not stick 1, cols[0:64] match and cols[64:128]
-    # are wrong.  Also show how many cols match and the worst offenders.
+
+    # Per-stick error localisation.  cols split into n_sticks sticks of 64; a
+    # slide that works for some sticks but not others shows up as one stick with
+    # a large error while the rest are small.
     per_col_err = (got - ref).abs()
     tol = ref.abs().max().item() * 2e-2 + 0.2
     n_match = int((per_col_err <= tol).sum())
-    half = COLS // 2
-    err_stick0 = per_col_err[:half].max().item()
-    err_stick1 = per_col_err[half:].max().item()
-    worst = per_col_err.argsort(descending=True)[:6].tolist()
-    print(f"    columns matching (tol {tol:.2f}): {n_match}/{COLS}")
-    print(
-        f"    max err  cols[0:{half}] (stick0) = {err_stick0:.3f}   "
-        f"cols[{half}:{COLS}] (stick1) = {err_stick1:.3f}"
+    print(f"    columns matching (tol {tol:.2f}): {n_match}/{cols}")
+    for s in range(n_sticks):
+        lo, hi = s * STICK, (s + 1) * STICK
+        print(
+            f"    stick {s}: max err cols[{lo}:{hi}] = {per_col_err[lo:hi].max().item():.3f}"
+        )
+    if not ok:
+        worst = per_col_err.argsort(descending=True)[:6].tolist()
+        print("    worst cols (col: got vs ref):")
+        for c in worst:
+            print(
+                f"      col {c:>3}: got={got[c].item():>8.2f}  ref={ref[c].item():>8.2f}"
+            )
+    return bool(ok)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--rows", type=int, default=DEFAULT_ROWS)
+    ap.add_argument("--cols", type=int, default=DEFAULT_COLS)
+    ap.add_argument("--window", type=int, default=DEFAULT_WINDOW)
+    ap.add_argument("--stride", type=int, default=DEFAULT_STRIDE)
+    ap.add_argument(
+        "--sweep",
+        action="store_true",
+        help="run the shape-hardening sweep instead of a single shape",
     )
-    print("    worst cols (col: got vs ref):")
-    for c in worst:
-        print(f"      col {c:>3}: got={got[c].item():>8.2f}  ref={ref[c].item():>8.2f}")
-    print()
-    if ok:
-        print("  RESULT: the frontend-generated sliding read is NUMERICALLY")
-        print("  CORRECT. Increments 1-3 compose end-to-end: spyre_hint(sliding=)")
-        print("  produces a real overlapping windowed read that computes the")
-        print("  coverage-weighted sum. The prototype works at SENCORES=1.")
-    elif sorted_match:
-        print("  RESULT: CORRECT VALUES, DIFFERENT ORDER. got is a permutation of")
-        print("  the overlap reference (same multiset of column sums) — the")
-        print("  element-wise mismatch is a stick-layout COLUMN-ORDERING artifact,")
-        print("  not a computation error. The sliding reduction is numerically")
-        print("  correct; only the output column order differs from natural order.")
-    elif torch.allclose(got, full, rtol=2e-2, atol=full.abs().max().item() * 2e-2):
-        print("  RESULT: output matches the PLAIN full sum, not the overlap ref.")
-        print("  => The stride override did not take effect (read did not slide).")
-        print("  Check that sliding_symbols reached generate_sdsc for the input.")
+    ap.add_argument(
+        "--no-dump",
+        action="store_true",
+        help="skip the bundle.mlir / geometry dump (quieter sweep output)",
+    )
+    args = ap.parse_args()
+
+    if args.sweep:
+        results = []
+        for rows, cols, window, stride in SWEEP_SHAPES:
+            ok = run_one(rows, cols, window, stride, dump=not args.no_dump)
+            results.append((rows, cols, window, stride, ok))
+        print("=" * 78)
+        print("SWEEP SUMMARY:")
+        for rows, cols, window, stride, ok in results:
+            print(
+                f"  D={rows:>4} COLS={cols:>4} W={window:>4} S={stride:>4}  "
+                f"{'PASS' if ok else 'FAIL'}"
+            )
+        n_pass = sum(1 for *_, ok in results if ok)
+        print(f"  {n_pass}/{len(results)} shapes numerically correct")
     else:
-        print("  RESULT: output matches NEITHER reference (values, not just order,")
-        print("  differ). Slide stride is correct now, so the residual is in the")
-        print("  reduction accumulation over overlapping tiles — inspect the log.")
+        run_one(args.rows, args.cols, args.window, args.stride, dump=not args.no_dump)
 
 
 if __name__ == "__main__":
