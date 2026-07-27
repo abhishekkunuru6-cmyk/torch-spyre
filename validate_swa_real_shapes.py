@@ -47,17 +47,31 @@ read-only sliding window over an INPUT: K/V need not claim a trip count at all.
 The count should come from the partitioning dim (Q) alone, leaving the sliding
 dim to satisfy only `base + S*(N-1) + W <= dim_size`.
 
-Proposed API for 5b — a sliding dim may opt out of setting the trip count, and
-may start at a non-zero (possibly negative, once padded) base:
+The API 5b implements — a sliding dim may opt out of setting the trip count:
 
     with spyre_hint(sliding={
-        "QS": {"window": 64, "stride": 64},                  # sets N
-        "KV": {"window": W, "stride": 64, "base": -(W - 64), # follows N
-               "counts_tiles": False},
+        "QS": {"window": 64, "stride": 64},                     # sets N
+        "KV": {"window": W, "stride": 64, "counts_tiles": False},  # follows N
     }):
 
 Relaxing this DELETES the `QSEQ//q_block == KVSEQ//W` constraint increment 2a
 found — it was a symptom of deriving N from the wrong dim, not a law.
+
+A `base` parameter was considered for blocker B and deliberately NOT built,
+because it can never do any work:
+
+  * base > 0 (the decode case) is just a slice — `k[base:]` makes the window
+    start at `i*S` again, and slicing is already supported.
+  * base < 0 reads addresses below the tensor, which is only valid if that
+    memory belongs to the tensor, i.e. if it was padded.  And once it IS padded,
+    the base is 0 again.
+
+So every expressible case reduces to base 0, and the inexpressible one is
+inexpressible for a reason.  Blocker B is handled by padding, not by a hint
+parameter.  Whether 5d pads the real KV cache or peels the ragged prefix blocks
+is a cost question left to 5d — note the prefix is `left_pad // 64` blocks
+(2 for window_size=128, but 64 for Gemma's 4096), so peeling does not obviously
+win.
 
 How the ragged prefix is handled
 ----------------------------------
@@ -475,16 +489,26 @@ def run_compile(shape: SwaShape, dump: bool) -> bool:
     k_pad = pad_kv(k, shape)
     v_pad = pad_kv(v, shape)
     padded_kv = k_pad.shape[0]
-    # The per-block masks stacked along Q: [seqlen_q, read_extent].  A row block
-    # is tile-local in KV, so this rides the Q partition slide, not the KV one.
-    masks = torch.cat([band_mask(shape, qi) for qi in range(shape.num_q_blocks)]).to(
-        torch.float16
-    )
+    # The mask has to be FULL [seqlen_q, padded_kv], not the compact
+    # [seqlen_q, read_extent] band: the untiled carrier program computes
+    # q @ kT at full width, so the add only typechecks at full width.  Its KV
+    # axis is then the named KV dim and rides the SAME slide as k and v, so
+    # iteration i reads exactly block i's band out of it.  Everything outside
+    # the band is -inf and never read.
+    masks = torch.full((shape.seqlen_q, padded_kv), NEG_INF, dtype=torch.float32)
+    for qi in range(shape.num_q_blocks):
+        q_lo = qi * shape.q_block
+        kv_lo = shape.window_lo(qi) + shape.left_pad
+        masks[q_lo : q_lo + shape.q_block, kv_lo : kv_lo + shape.read_extent] = (
+            band_mask(shape, qi)
+        )
+    masks = masks.to(torch.float16)
 
     def fn(q, k, v, masks):
         # KV follows Q's trip count instead of setting its own — the 5b
-        # extension.  base is folded into the padding here, so the hint itself
-        # still starts at 0; a real base= parameter would drop the pre-pad.
+        # extension.  The negative window origin is folded into the K/V padding,
+        # so the hint itself still starts at 0 (see the module docstring on why
+        # a `base` parameter would not have helped).
         with spyre_hint(
             sliding={
                 "QS": {"window": shape.q_block, "stride": shape.q_block},

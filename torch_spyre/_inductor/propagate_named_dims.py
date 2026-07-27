@@ -542,6 +542,33 @@ def propagate_named_dims(
         _enabled = False
 
 
+@dataclasses.dataclass(frozen=True)
+class _SlidingSpec:
+    """One dim's sliding-window request, parsed and individually validated.
+
+    ``counts_tiles`` distinguishes the two roles a coupled dim can play.  A
+    COUNTING dim is being partitioned, so its own ``dim_size // window`` is the
+    loop's trip count.  A FOLLOWER dim is only being read through a moving
+    window and has no opinion about how many iterations there are — it just has
+    to stay in bounds for however many the counting dim asks for.
+    """
+
+    name: str
+    window: int
+    stride: int
+    dim_size: int
+    counts_tiles: bool
+
+    @property
+    def own_tiles(self) -> int:
+        """This dim's own trip count.  Meaningful only when ``counts_tiles``."""
+        return self.dim_size // self.window
+
+    def last_window_end(self, trip_count: int) -> int:
+        """Where the final window ends, given the loop's trip count."""
+        return self.stride * (trip_count - 1) + self.window
+
+
 def _append_sliding_hints(
     sliding: dict,
     hint_id: int,
@@ -563,13 +590,43 @@ def _append_sliding_hints(
     scope's ``hint_id``, and ``hint_id`` is what coarse_tile turns into a loop
     level, so one hint scope stays one level no matter how many dims it names.
 
-    Coupling constrains the shapes: one loop level has one trip count, so every
-    coupled dim must yield the same ``dim_size // window``.
+    By default every dim also SETS the trip count from its own
+    ``dim_size // window``, which requires the windows to tile the dim exactly.
+    Pass ``counts_tiles: False`` for a dim that is only being read through a
+    moving window — it then follows the count the other dims set and need only
+    stay in bounds.  Real sliding-window attention needs this: the trip count is
+    the number of Q blocks, while the KV window is ``window_size + q_block``
+    wide, and those two have no reason to divide the KV length the same way.
     """
-    specs: list[tuple[str, int, int, int, int]] = []
+    specs = _parse_sliding_specs(sliding)
+    trip_count = _resolve_trip_count(specs)
+    _validate_coupled_sliding(specs, trip_count, coord_for_name, reduction_dims)
+
+    for spec in specs:
+        dim_hints.append(
+            DimHint(
+                dim_names=[spec.name],
+                split_count=trip_count,
+                loop_var=coord_for_name.get(spec.name),
+                is_reduction=spec.name in reduction_dims,
+                hint_id=hint_id,
+                read_extent=spec.window,
+                slide_stride=spec.stride,
+            )
+        )
+
+
+def _parse_sliding_specs(sliding: dict) -> list[_SlidingSpec]:
+    """Parse and per-dim validate a ``sliding={...}`` scope.
+
+    Checks that do not depend on the resolved trip count live here; the
+    bounds check that does lives in ``_validate_coupled_sliding``.
+    """
+    specs: list[_SlidingSpec] = []
     for name, spec in sliding.items():
         window = int(spec["window"])
         stride = int(spec["stride"])
+        counts_tiles = bool(spec.get("counts_tiles", True))
         dim_size = _named_dims.get(name)
         if dim_size is None:
             raise ValueError(
@@ -582,75 +639,85 @@ def _append_sliding_hints(
                 f"({window}) <= dim_size ({dim_size}) and stride ({stride}) > 0."
             )
         # PARTITION+SLIDE model (matches the numerically-correct probe #2):
-        # loop_count * read_extent must equal dim_size (a clean partition the
-        # reduction machinery understands), so the trip count is num_tiles =
-        # dim_size // window, NOT num_windows.  The overlap comes ONLY from the
-        # affine slide (slide_stride < window) applied in codegen; it does not
-        # change the trip count.  window must divide dim_size.
-        if dim_size % window != 0:
+        # for a COUNTING dim, loop_count * read_extent must equal dim_size (a
+        # clean partition the reduction machinery understands), so the trip
+        # count is dim_size // window, NOT the number of windows.  The overlap
+        # comes ONLY from the affine slide (slide_stride < window) applied in
+        # codegen; it does not change the trip count.  A follower dim sets no
+        # count, so nothing has to divide anything.
+        if counts_tiles and dim_size % window != 0:
             raise ValueError(
                 f"spyre_hint(sliding=...) on {name!r}: window ({window}) must "
-                f"divide dim_size ({dim_size}) for the partition+slide model."
+                f"divide dim_size ({dim_size}) for the partition+slide model, "
+                "or pass counts_tiles=False to let another dim set the trip "
+                "count."
             )
-        num_tiles = dim_size // window
-        # The last window starts at stride*(num_tiles-1) and must fit.  With
-        # stride <= window this holds automatically; a gap-read (stride >
-        # window) can walk off the end, which would be a silent OOB read.
-        last_end = stride * (num_tiles - 1) + window
-        if last_end > dim_size:
-            raise ValueError(
-                f"spyre_hint(sliding=...) on {name!r}: the last of {num_tiles} "
-                f"windows ends at {last_end}, past dim_size ({dim_size}); "
-                f"stride ({stride}) must not exceed window ({window})."
-            )
-        specs.append((name, window, stride, num_tiles, dim_size))
-
-    _validate_coupled_sliding(specs, coord_for_name, reduction_dims)
-
-    for name, window, stride, num_tiles, _dim_size in specs:
-        dim_hints.append(
-            DimHint(
-                dim_names=[name],
-                split_count=num_tiles,
-                loop_var=coord_for_name.get(name),
-                is_reduction=name in reduction_dims,
-                hint_id=hint_id,
-                read_extent=window,
-                slide_stride=stride,
+        specs.append(
+            _SlidingSpec(
+                name=name,
+                window=window,
+                stride=stride,
+                dim_size=dim_size,
+                counts_tiles=counts_tiles,
             )
         )
+    return specs
+
+
+def _resolve_trip_count(specs: list[_SlidingSpec]) -> int:
+    """The loop's trip count, taken from the counting dims (which must agree)."""
+    counting = [s for s in specs if s.counts_tiles]
+    if not counting:
+        raise ValueError(
+            "spyre_hint(sliding=...) has counts_tiles=False on every dim "
+            f"({', '.join(s.name for s in specs)}), so nothing sets the loop's "
+            "trip count.  At least one dim must be partitioned."
+        )
+    counts = {s.name: s.own_tiles for s in counting}
+    if len(set(counts.values())) > 1:
+        raise ValueError(
+            "spyre_hint(sliding=...) couples dims under one loop level, so the "
+            "counting dims must agree on the trip count, but dim_size // window "
+            "differs: "
+            + ", ".join(f"{n}={c}" for n, c in counts.items())
+            + ".  Pick matching windows, or pass counts_tiles=False on the dims "
+            "that are only being read through a window."
+        )
+    return next(iter(counts.values()))
 
 
 def _validate_coupled_sliding(
-    specs: list[tuple[str, int, int, int, int]],
+    specs: list[_SlidingSpec],
+    trip_count: int,
     coord_for_name: dict,
     reduction_dims: set,
 ) -> None:
-    """Check that a multi-dim sliding scope can share one loop level.
+    """Check the resolved trip count works for every dim in the scope."""
+    for spec in specs:
+        # The last window starts at stride*(trip_count-1) and must fit.  For a
+        # counting dim with stride <= window this holds automatically; for a
+        # follower it is the ONLY thing keeping the read in bounds, since the
+        # count came from somewhere else entirely.
+        last_end = spec.last_window_end(trip_count)
+        if last_end > spec.dim_size:
+            raise ValueError(
+                f"spyre_hint(sliding=...) on {spec.name!r}: the last of "
+                f"{trip_count} windows ends at {last_end}, past dim_size "
+                f"({spec.dim_size}).  Widen the dim, shorten the stride "
+                f"({spec.stride}), or reduce the trip count."
+            )
 
-    ``specs`` entries are ``(name, window, stride, num_tiles, dim_size)``.
-    Single-dim scopes are always fine and return immediately.
-    """
     if len(specs) < 2:
         return
-
-    trip_counts = {name: num_tiles for name, _w, _s, num_tiles, _d in specs}
-    if len(set(trip_counts.values())) > 1:
-        raise ValueError(
-            "spyre_hint(sliding=...) couples dims under one loop level, so they "
-            "must share a trip count, but dim_size // window differs: "
-            + ", ".join(f"{n}={c}" for n, c in trip_counts.items())
-            + ".  Pick windows so every coupled dim yields the same tile count."
-        )
 
     # Several OUTPUT dims may share a level (SWA's q @ kT slides the score rows
     # and the score columns together), but coarse_tile still tiles at most one
     # REDUCTION range position per level — see _validate_reduction_tiling.  Only
     # dims this op actually iterates (loop_var resolved) count.
     coupled_reductions = [
-        name
-        for name, *_ in specs
-        if name in reduction_dims and coord_for_name.get(name) is not None
+        s.name
+        for s in specs
+        if s.name in reduction_dims and coord_for_name.get(s.name) is not None
     ]
     if len(coupled_reductions) > 1:
         raise NotImplementedError(

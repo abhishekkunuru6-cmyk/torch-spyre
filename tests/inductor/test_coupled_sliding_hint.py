@@ -45,7 +45,10 @@ from torch_spyre._inductor.coarse_tile import (
 )
 from torch_spyre._inductor.loop_info import CoarseTileInfo
 from torch_spyre._inductor.propagate_named_dims import (
+    _SlidingSpec,
     _append_sliding_hints,
+    _parse_sliding_specs,
+    _resolve_trip_count,
     _validate_coupled_sliding,
 )
 
@@ -58,64 +61,154 @@ NUM_TILES = 4
 QSEQ = Q_BLOCK * NUM_TILES  # 256
 KVSEQ = KV_WINDOW * NUM_TILES  # 512
 
+# A real SWA shape, which the counting model cannot express: 8 Q blocks but a
+# 192-wide KV window that neither divides 512 nor yields 8 tiles.
+SWA_QSEQ = 512
+SWA_KVSEQ = 640  # 512 + 128 left padding
+SWA_WINDOW = 192
+SWA_BLOCKS = SWA_QSEQ // Q_BLOCK  # 8
 
-def _spec(name, window, stride, num_tiles, dim_size):
-    """One ``_validate_coupled_sliding`` spec tuple."""
-    return (name, window, stride, num_tiles, dim_size)
+
+def _spec(name, window, stride, dim_size, counts_tiles=True):
+    return _SlidingSpec(
+        name=name,
+        window=window,
+        stride=stride,
+        dim_size=dim_size,
+        counts_tiles=counts_tiles,
+    )
+
+
+class TestResolveTripCount(unittest.TestCase):
+    """Which dims set the loop's trip count, and what happens when they clash."""
+
+    def test_single_dim_sets_the_count(self):
+        specs = [_spec("KV", KV_WINDOW, KV_STRIDE, KVSEQ)]
+        self.assertEqual(_resolve_trip_count(specs), NUM_TILES)
+
+    def test_matching_counting_dims_ok(self):
+        specs = [
+            _spec("QS", Q_BLOCK, Q_BLOCK, QSEQ),
+            _spec("KV", KV_WINDOW, KV_STRIDE, KVSEQ),
+        ]
+        self.assertEqual(_resolve_trip_count(specs), NUM_TILES)
+
+    def test_mismatched_counting_dims_raise(self):
+        """Counting dims share one level, so they must agree on the count."""
+        specs = [
+            _spec("QS", Q_BLOCK, Q_BLOCK, 128),  # 2 tiles
+            _spec("KV", KV_WINDOW, KV_STRIDE, KVSEQ),  # 4 tiles
+        ]
+        with self.assertRaises(ValueError) as cm:
+            _resolve_trip_count(specs)
+        self.assertIn("agree on the trip count", str(cm.exception))
+
+    def test_follower_takes_the_counting_dims_number(self):
+        """A real SWA shape: 8 Q blocks, and KV just follows along."""
+        specs = [
+            _spec("QS", Q_BLOCK, Q_BLOCK, SWA_QSEQ),
+            _spec("KV", SWA_WINDOW, Q_BLOCK, SWA_KVSEQ, counts_tiles=False),
+        ]
+        self.assertEqual(_resolve_trip_count(specs), SWA_BLOCKS)
+
+    def test_all_followers_raise(self):
+        specs = [
+            _spec("QS", Q_BLOCK, Q_BLOCK, QSEQ, counts_tiles=False),
+            _spec("KV", KV_WINDOW, KV_STRIDE, KVSEQ, counts_tiles=False),
+        ]
+        with self.assertRaises(ValueError) as cm:
+            _resolve_trip_count(specs)
+        self.assertIn("nothing sets the loop's trip count", str(cm.exception))
+
+
+class TestParseSlidingSpecs(unittest.TestCase):
+    """Per-dim parsing, including the divisibility rule a follower escapes."""
+
+    def setUp(self):
+        pnd.reset()
+        pnd.declare_tensor_dim("QS", SWA_QSEQ)
+        pnd.declare_tensor_dim("KV", SWA_KVSEQ)
+
+    def tearDown(self):
+        pnd.reset()
+
+    def test_counting_dim_requires_divisibility(self):
+        with self.assertRaises(ValueError) as cm:
+            _parse_sliding_specs({"KV": {"window": SWA_WINDOW, "stride": Q_BLOCK}})
+        self.assertIn("must divide dim_size", str(cm.exception))
+
+    def test_follower_dim_escapes_divisibility(self):
+        """640 % 192 != 0, which only matters for a dim that sets the count."""
+        specs = _parse_sliding_specs(
+            {
+                "KV": {
+                    "window": SWA_WINDOW,
+                    "stride": Q_BLOCK,
+                    "counts_tiles": False,
+                }
+            }
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertFalse(specs[0].counts_tiles)
+
+    def test_counts_tiles_defaults_true(self):
+        specs = _parse_sliding_specs({"QS": {"window": Q_BLOCK, "stride": Q_BLOCK}})
+        self.assertTrue(specs[0].counts_tiles)
 
 
 class TestValidateCoupledSliding(unittest.TestCase):
-    """Shape and dim-kind constraints a coupled scope must satisfy."""
+    """Bounds and dim-kind constraints, given the resolved trip count."""
 
     def test_single_dim_scope_is_always_ok(self):
-        specs = [_spec("KV", KV_WINDOW, KV_STRIDE, NUM_TILES, KVSEQ)]
-        _validate_coupled_sliding(specs, {"KV": sympy.Symbol("c0")}, {"KV"})
+        specs = [_spec("KV", KV_WINDOW, KV_STRIDE, KVSEQ)]
+        _validate_coupled_sliding(specs, NUM_TILES, {"KV": sympy.Symbol("c0")}, {"KV"})
 
-    def test_matching_trip_counts_ok(self):
+    def test_follower_in_bounds_ok(self):
+        """8 windows of 192 striding by 64 end at 640 — exactly the dim."""
         specs = [
-            _spec("QS", Q_BLOCK, Q_BLOCK, NUM_TILES, QSEQ),
-            _spec("KV", KV_WINDOW, KV_STRIDE, NUM_TILES, KVSEQ),
+            _spec("QS", Q_BLOCK, Q_BLOCK, SWA_QSEQ),
+            _spec("KV", SWA_WINDOW, Q_BLOCK, SWA_KVSEQ, counts_tiles=False),
         ]
         coords = {"QS": sympy.Symbol("c0"), "KV": sympy.Symbol("r0")}
-        _validate_coupled_sliding(specs, coords, {"KV"})
+        _validate_coupled_sliding(specs, SWA_BLOCKS, coords, {"KV"})
 
-    def test_mismatched_trip_counts_raise(self):
-        """One loop level has one trip count — dim_size // window must agree."""
+    def test_follower_out_of_bounds_raises(self):
+        """A follower's ONLY bound is the count someone else chose."""
         specs = [
-            _spec("QS", Q_BLOCK, Q_BLOCK, 2, 128),
-            _spec("KV", KV_WINDOW, KV_STRIDE, NUM_TILES, KVSEQ),
+            _spec("QS", Q_BLOCK, Q_BLOCK, SWA_QSEQ),
+            _spec("KV", SWA_WINDOW, Q_BLOCK, SWA_KVSEQ - 64, counts_tiles=False),
         ]
         coords = {"QS": sympy.Symbol("c0"), "KV": sympy.Symbol("r0")}
         with self.assertRaises(ValueError) as cm:
-            _validate_coupled_sliding(specs, coords, {"KV"})
-        self.assertIn("share a trip count", str(cm.exception))
+            _validate_coupled_sliding(specs, SWA_BLOCKS, coords, {"KV"})
+        self.assertIn("past dim_size", str(cm.exception))
 
     def test_two_output_dims_ok(self):
         """q @ kT slides the score rows and columns — both output dims."""
         specs = [
-            _spec("QS", Q_BLOCK, Q_BLOCK, NUM_TILES, QSEQ),
-            _spec("KV", KV_WINDOW, KV_STRIDE, NUM_TILES, KVSEQ),
+            _spec("QS", Q_BLOCK, Q_BLOCK, QSEQ),
+            _spec("KV", KV_WINDOW, KV_STRIDE, KVSEQ),
         ]
         coords = {"QS": sympy.Symbol("c0"), "KV": sympy.Symbol("c1")}
-        _validate_coupled_sliding(specs, coords, set())
+        _validate_coupled_sliding(specs, NUM_TILES, coords, set())
 
     def test_two_reduction_dims_raise(self):
         specs = [
-            _spec("QS", Q_BLOCK, Q_BLOCK, NUM_TILES, QSEQ),
-            _spec("KV", KV_WINDOW, KV_STRIDE, NUM_TILES, KVSEQ),
+            _spec("QS", Q_BLOCK, Q_BLOCK, QSEQ),
+            _spec("KV", KV_WINDOW, KV_STRIDE, KVSEQ),
         ]
         coords = {"QS": sympy.Symbol("r0"), "KV": sympy.Symbol("r1")}
         with self.assertRaises(NotImplementedError) as cm:
-            _validate_coupled_sliding(specs, coords, {"QS", "KV"})
+            _validate_coupled_sliding(specs, NUM_TILES, coords, {"QS", "KV"})
         self.assertIn("reduction dims", str(cm.exception))
 
     def test_unresolved_dim_does_not_clash(self):
         """A dim this op does not iterate (loop_var None) cannot collide."""
         specs = [
-            _spec("QS", Q_BLOCK, Q_BLOCK, NUM_TILES, QSEQ),
-            _spec("KV", KV_WINDOW, KV_STRIDE, NUM_TILES, KVSEQ),
+            _spec("QS", Q_BLOCK, Q_BLOCK, QSEQ),
+            _spec("KV", KV_WINDOW, KV_STRIDE, KVSEQ),
         ]
-        _validate_coupled_sliding(specs, {"QS": sympy.Symbol("c0")}, set())
+        _validate_coupled_sliding(specs, NUM_TILES, {"QS": sympy.Symbol("c0")}, set())
 
 
 class TestAppendSlidingHints(unittest.TestCase):
@@ -180,6 +273,33 @@ class TestAppendSlidingHints(unittest.TestCase):
                 dim_hints=dim_hints,
             )
         self.assertIn("past dim_size", str(cm.exception))
+
+    def test_real_swa_shape_end_to_end(self):
+        """The shape increment 5a showed the counting model cannot express."""
+        pnd.reset()
+        pnd.declare_tensor_dim("QS", SWA_QSEQ)
+        pnd.declare_tensor_dim("KV", SWA_KVSEQ)
+        dim_hints = []
+        _append_sliding_hints(
+            {
+                "QS": {"window": Q_BLOCK, "stride": Q_BLOCK},
+                "KV": {
+                    "window": SWA_WINDOW,
+                    "stride": Q_BLOCK,
+                    "counts_tiles": False,
+                },
+            },
+            hint_id=0,
+            coord_for_name={"QS": sympy.Symbol("c0"), "KV": sympy.Symbol("c1")},
+            reduction_dims=set(),
+            dim_hints=dim_hints,
+        )
+        hints = {h.dim_names[0]: h for h in dim_hints}
+        # Both follow Q's 8 blocks, and KV keeps its own 192-wide window.
+        self.assertEqual(hints["QS"].split_count, SWA_BLOCKS)
+        self.assertEqual(hints["KV"].split_count, SWA_BLOCKS)
+        self.assertEqual(hints["KV"].read_extent, SWA_WINDOW)
+        self.assertEqual(hints["KV"].slide_stride, Q_BLOCK)
 
     def test_undeclared_dim_raises(self):
         dim_hints = []
