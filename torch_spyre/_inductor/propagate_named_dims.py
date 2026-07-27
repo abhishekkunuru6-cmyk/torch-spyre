@@ -657,7 +657,7 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
                 if name in reduction_dims:
                     coord_for_name[name] = sym
 
-        dim_hints = []
+        dim_hints: list[DimHint] = []
         for hint_id, hint_dict in sorted(op_hints.items()):
             # Sliding-window tiling: sliding={"A": {"window": W, "stride": S}}.
             # A separate shape from the count-based hints — it carries a window

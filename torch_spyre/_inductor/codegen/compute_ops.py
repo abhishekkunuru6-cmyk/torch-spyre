@@ -830,14 +830,22 @@ def generate_sdsc(
                             # the intended slide.)  Exact int division: base is a
                             # multiple of read_extent.
                             new_stride = stride * slide_stride // read_extent
-                            popped = tensor.backGap.pop(s, None)
+                            # Keep tensor.backGap[s]: it is the intra-op walk
+                            # correction (dev_dim_size - it_dim_size) that lets a
+                            # window narrower than the physical dim step to the
+                            # NEXT dim (e.g. the stick dim `mb`) at the right
+                            # base.  The affine slide (inter-iteration base
+                            # advance) is independent of it, so popping it breaks
+                            # multi-stick reads (stick 1 lands short by the gap)
+                            # while single-stick is unaffected.
+                            kept_backGap = tensor.backGap.get(s)
                             print(  # SWA-DEBUG
                                 f"SWA-DEBUG override sym={s} "
                                 f"base_byte_stride={stride} -> {new_stride} "
                                 f"(read_extent={read_extent} "
                                 f"slide_stride={slide_stride}) "
                                 f"tensor.strides[s]={tensor.strides.get(s)} "
-                                f"dropped_backGap={popped}",
+                                f"kept_backGap={kept_backGap}",
                                 flush=True,
                             )
                             stride = new_stride
