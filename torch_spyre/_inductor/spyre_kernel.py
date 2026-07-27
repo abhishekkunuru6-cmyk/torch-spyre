@@ -600,8 +600,16 @@ class SpyreKernel(Kernel[CSEVariable]):
             li.loop_tiled_reduction_dims if li is not None else []
         )
         # Sliding-window params, one entry per nesting level (None => partition).
+        # Output-dim and reduction-dim params are separate: a coupled level
+        # slides both, with different window/stride each.
         raw_read_extent: list = li.loop_read_extent if li is not None else []
         raw_slide_stride: list = li.loop_slide_stride if li is not None else []
+        raw_red_read_extent: list = (
+            getattr(li, "loop_reduction_read_extent", []) if li is not None else []
+        )
+        raw_red_slide_stride: list = (
+            getattr(li, "loop_reduction_slide_stride", []) if li is not None else []
+        )
         # CoarseTileInfo always constructs loop_tiled_dims and
         # loop_tiled_reduction_dims with the same length (one sublist per
         # nesting level), so max() is just a safety net; in practice both
@@ -644,27 +652,41 @@ class SpyreKernel(Kernel[CSEVariable]):
                 if int(r) != 1
             )
 
+            def _level_sliding(
+                syms: list, extents: list, strides: list, lvl: int
+            ) -> None:
+                """Record (read_extent, slide_stride) for one level's symbols.
+
+                Output-dim and reduction-dim symbols are recorded from their own
+                param lists, so a coupled level gives each dim the window and
+                stride that were hinted for IT — fanning one pair across every
+                symbol at the level would give the reduction dim the output
+                dim's slide.
+                """
+                extent = extents[lvl] if lvl < len(extents) else None
+                stride = strides[lvl] if lvl < len(strides) else None
+                if extent is None or stride is None:
+                    return
+                for s in syms:
+                    sliding_by_sym[s] = (extent, stride)
+
             tiled_syms_per_level_outermost: list[list] = []
             for lvl in range(n_levels):
-                level_syms: list = []
+                out_syms: list = []
                 if lvl < len(raw_tiled_dims):
                     for d in raw_tiled_dims[lvl]:
                         mapped = host_to_it.get(d)
                         if mapped is not None and mapped < len(it_space_keys):
-                            level_syms.append(it_space_keys[mapped])
+                            out_syms.append(it_space_keys[mapped])
+                red_syms: list = []
                 if lvl < len(raw_tiled_red_dims):
                     for r in raw_tiled_red_dims[lvl]:
                         sym_idx = n_output_it_syms + r
                         if sym_idx < len(it_space_keys):
-                            level_syms.append(it_space_keys[sym_idx])
-                tiled_syms_per_level_outermost.append(level_syms)
-                # A sliding level's (read_extent, slide_stride) applies to that
-                # level's tiled symbol(s).
-                re = raw_read_extent[lvl] if lvl < len(raw_read_extent) else None
-                ss = raw_slide_stride[lvl] if lvl < len(raw_slide_stride) else None
-                if re is not None and ss is not None:
-                    for s in level_syms:
-                        sliding_by_sym[s] = (re, ss)
+                            red_syms.append(it_space_keys[sym_idx])
+                tiled_syms_per_level_outermost.append(out_syms + red_syms)
+                _level_sliding(out_syms, raw_read_extent, raw_slide_stride, lvl)
+                _level_sliding(red_syms, raw_red_read_extent, raw_red_slide_stride, lvl)
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
 

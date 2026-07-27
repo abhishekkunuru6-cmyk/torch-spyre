@@ -52,14 +52,23 @@ class CoarseTileInfo:
         tiled at that level.  Parallel to ``loop_tiled_dims``.
     loop_slide_stride:
         Sliding-window tiling only.  List (one entry per nesting level) of the
-        per-iteration base advance (block) for that level's tiled dim, or
-        ``None`` for ordinary partition tiling.  When set, the loop advances a
-        tiled input's base by this stride each iteration while it reads
+        per-iteration base advance (block) for that level's tiled OUTPUT dim,
+        or ``None`` for ordinary partition tiling.  When set, the loop advances
+        a tiled input's base by this stride each iteration while it reads
         ``loop_read_extent`` elements, so consecutive reads OVERLAP when
         ``read_extent > slide_stride``.  Empty list => all levels partition.
     loop_read_extent:
         Parallel to ``loop_slide_stride``: the per-iteration read width
-        (window) for a sliding level, or ``None`` for partition tiling.
+        (window) for a sliding level's output dim, or ``None`` for partition
+        tiling.
+    loop_reduction_slide_stride:
+        As ``loop_slide_stride``, but for the level's tiled REDUCTION dim.
+        Kept separate because one level can slide an output dim and a reduction
+        dim with DIFFERENT window/stride — the coupled causal-diagonal shape
+        (Q partition-slides while KV overlap-slides under the same loop var).
+    loop_reduction_read_extent:
+        Parallel to ``loop_reduction_slide_stride``: the reduction dim's
+        per-iteration read width.
     """
 
     loop_group_id: tuple[int, ...]
@@ -68,6 +77,8 @@ class CoarseTileInfo:
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
     loop_slide_stride: list[int | None] = field(default_factory=list)
     loop_read_extent: list[int | None] = field(default_factory=list)
+    loop_reduction_slide_stride: list[int | None] = field(default_factory=list)
+    loop_reduction_read_extent: list[int | None] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

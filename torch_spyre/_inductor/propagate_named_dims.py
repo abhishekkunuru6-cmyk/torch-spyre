@@ -551,15 +551,22 @@ def _append_sliding_hints(
 ) -> None:
     """Turn a sliding={"A": {"window": W, "stride": S}} scope into DimHints.
 
-    ``split_count`` is the number of windows, ``(dim_size - W) // S + 1``.
-    ``read_extent`` (= W) and ``slide_stride`` (= S) carry the overlap.  The
-    dim must be declared (``declare_tensor_dim``) so its size is known.
+    One DimHint per named dim.  ``read_extent`` (= W) and ``slide_stride``
+    (= S) carry the overlap; the dim must be declared (``declare_tensor_dim``)
+    so its size is known.
+
+    A dict with MORE THAN ONE entry means the dims are **coupled**: they all
+    advance under a single shared loop level, each with its own window/stride.
+    That is the causal-diagonal shape sliding-window attention needs — one loop
+    var `i` partition-slides the Q rows (window == stride, disjoint) while it
+    overlap-slides the KV window (stride < window).  The DimHints share this
+    scope's ``hint_id``, and ``hint_id`` is what coarse_tile turns into a loop
+    level, so one hint scope stays one level no matter how many dims it names.
+
+    Coupling constrains the shapes: one loop level has one trip count, so every
+    coupled dim must yield the same ``dim_size // window``.
     """
-    if len(sliding) > 1:
-        raise NotImplementedError(
-            f"spyre_hint(sliding=...) specifies {len(sliding)} dimensions; "
-            "only one is currently allowed per spyre_hint() call."
-        )
+    specs: list[tuple[str, int, int, int, int]] = []
     for name, spec in sliding.items():
         window = int(spec["window"])
         stride = int(spec["stride"])
@@ -586,6 +593,21 @@ def _append_sliding_hints(
                 f"divide dim_size ({dim_size}) for the partition+slide model."
             )
         num_tiles = dim_size // window
+        # The last window starts at stride*(num_tiles-1) and must fit.  With
+        # stride <= window this holds automatically; a gap-read (stride >
+        # window) can walk off the end, which would be a silent OOB read.
+        last_end = stride * (num_tiles - 1) + window
+        if last_end > dim_size:
+            raise ValueError(
+                f"spyre_hint(sliding=...) on {name!r}: the last of {num_tiles} "
+                f"windows ends at {last_end}, past dim_size ({dim_size}); "
+                f"stride ({stride}) must not exceed window ({window})."
+            )
+        specs.append((name, window, stride, num_tiles, dim_size))
+
+    _validate_coupled_sliding(specs, coord_for_name, reduction_dims)
+
+    for name, window, stride, num_tiles, _dim_size in specs:
         dim_hints.append(
             DimHint(
                 dim_names=[name],
@@ -597,6 +619,47 @@ def _append_sliding_hints(
                 slide_stride=stride,
             )
         )
+
+
+def _validate_coupled_sliding(
+    specs: list[tuple[str, int, int, int, int]],
+    coord_for_name: dict,
+    reduction_dims: set,
+) -> None:
+    """Check that a multi-dim sliding scope can share one loop level.
+
+    ``specs`` entries are ``(name, window, stride, num_tiles, dim_size)``.
+    Single-dim scopes are always fine and return immediately.
+    """
+    if len(specs) < 2:
+        return
+
+    trip_counts = {name: num_tiles for name, _w, _s, num_tiles, _d in specs}
+    if len(set(trip_counts.values())) > 1:
+        raise ValueError(
+            "spyre_hint(sliding=...) couples dims under one loop level, so they "
+            "must share a trip count, but dim_size // window differs: "
+            + ", ".join(f"{n}={c}" for n, c in trip_counts.items())
+            + ".  Pick windows so every coupled dim yields the same tile count."
+        )
+
+    # coarse_tile resolves a hint_id to at most one output-range position and
+    # one reduction-range position per op, so two coupled dims that land on the
+    # same side for the same op would silently drop one.  Only dims this op
+    # actually iterates (loop_var resolved) can collide.
+    resolved = [
+        (name, name in reduction_dims)
+        for name, *_ in specs
+        if coord_for_name.get(name) is not None
+    ]
+    for is_reduction, kind in ((False, "output"), (True, "reduction")):
+        clashing = [name for name, red in resolved if red == is_reduction]
+        if len(clashing) > 1:
+            raise NotImplementedError(
+                f"spyre_hint(sliding=...) couples {len(clashing)} {kind} dims "
+                f"({', '.join(clashing)}) in one scope; a coupled scope supports "
+                "at most one output dim and one reduction dim per op."
+            )
 
 
 def _assign_dim_hints_impl(operations: list[Operation]) -> None:
