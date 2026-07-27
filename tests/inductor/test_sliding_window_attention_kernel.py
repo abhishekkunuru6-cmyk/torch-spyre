@@ -120,6 +120,43 @@ class TestSlidingWindowAttentionKernel(
                     100,
                     True,
                 ),
+                # batch=1 prefill — the ONLY shapes plan_sliding_window()
+                # accepts, so these are the only cases that exercise the
+                # SPYRE_SWA_SLIDING_LOOP path at all (it needs batch == 1 and
+                # seqlen_q a whole number of 64-row Q blocks; every other case
+                # in this file is batch=2 and falls back to the unrolled loop).
+                # They must pass with the flag OFF too — then they are just
+                # ordinary unrolled coverage — so a flag-on/flag-off diff
+                # isolates the sliding path exactly.
+                "mha_prefill_causal_w64_b1": (
+                    cached_randn(
+                        (1, 256, 8, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 256, 8, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 256, 8, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    64,
+                    True,
+                ),
+                # Same, with GQA (8 q heads / 2 kv heads).  batch=1 GQA is the
+                # combination validate_swa_4d_rank.py verified under the slide;
+                # batch>1 GQA is a known-open defect, hence batch=1 here.
+                "gqa_prefill_causal_w64_b1": (
+                    cached_randn(
+                        (1, 256, 8, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 256, 2, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 256, 2, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    64,
+                    True,
+                ),
                 # MHA, decode (Lq=1, Lk=full cache) — the real hf-adapters call shape.
                 "mha_decode_causal_w64": (
                     cached_randn(
