@@ -87,18 +87,21 @@ class TestPlanAcceptance(unittest.TestCase):
         """A short final block would read a different width — not a constant window."""
         self.assertIsNone(plan_sliding_window(**{**PREFILL, "seqlen_q": 512 - 32}))
 
-    def test_decode_shape(self):
-        """Lq=64, Lkv=512: one block, window entirely inside the sequence."""
-        plan = plan_sliding_window(
-            batch_size=1,
-            seqlen_q=64,
-            seqlen_kv=512,
-            window_size=128,
-            is_causal=True,
+    def test_unpadded_shape_falls_back(self):
+        """Lq=64, Lkv=512: the window sits inside the cache, so no padding.
+
+        Declined because there is then no concatenate op to carry V's
+        named_dims hint — see plan_sliding_window.  The unrolled path handles it.
+        """
+        self.assertIsNone(
+            plan_sliding_window(
+                batch_size=1,
+                seqlen_q=64,
+                seqlen_kv=512,
+                window_size=128,
+                is_causal=True,
+            )
         )
-        self.assertIsNotNone(plan)
-        self.assertEqual(plan.num_q_blocks, 1)
-        self.assertEqual(plan.left_pad, 0)  # base is well inside the cache
 
     def test_non_causal_needs_right_pad(self):
         """The bidirectional band reaches forward, past the sequence end."""
@@ -221,25 +224,26 @@ class TestDispatchGating(unittest.TestCase):
         self.assertIsNotNone(plan_sliding_window(**PREFILL))
         self.assertIsNone(plan_sliding_window(**{**PREFILL, "batch_size": 4}))
 
-    def test_padding_helper_matches_the_plan(self):
-        from torch_spyre._inductor.decompositions import _pad_kv_sequence
+    def test_pad_parts_concatenate_to_the_planned_length(self):
+        from torch_spyre._inductor.decompositions import _kv_pad_parts
 
         plan = plan_sliding_window(**PREFILL)
         kv = torch.zeros(1, 2, plan_seqlen_kv(plan), 8)
-        padded = _pad_kv_sequence(kv, plan)
+        parts = _kv_pad_parts(kv, plan)
+        joined = torch.cat(parts, dim=-2)
         # Padding goes on the SEQUENCE axis, not the head axis.
-        self.assertEqual(padded.shape[-2], plan.padded_kv)
-        self.assertEqual(padded.shape[1], 2)
+        self.assertEqual(joined.shape[-2], plan.padded_kv)
+        self.assertEqual(joined.shape[1], 2)
 
-    def test_padding_helper_is_identity_when_unneeded(self):
-        from torch_spyre._inductor.decompositions import _pad_kv_sequence
+    def test_pad_parts_keeps_the_real_tensor_at_the_planned_offset(self):
+        """The window offsets assume the real K/V starts at left_pad."""
+        from torch_spyre._inductor.decompositions import _kv_pad_parts
 
-        plan = plan_sliding_window(
-            batch_size=1, seqlen_q=64, seqlen_kv=512, window_size=128, is_causal=True
-        )
-        self.assertEqual((plan.left_pad, plan.right_pad), (0, 0))
-        kv = torch.zeros(1, 2, 512, 8)
-        self.assertIs(_pad_kv_sequence(kv, plan), kv)
+        plan = plan_sliding_window(**PREFILL)
+        kv = torch.ones(1, 2, plan_seqlen_kv(plan), 8)
+        joined = torch.cat(_kv_pad_parts(kv, plan), dim=-2)
+        self.assertTrue((joined[..., : plan.left_pad, :] == 0).all())
+        self.assertTrue((joined[..., plan.left_pad :, :] == 1).all())
 
 
 if __name__ == "__main__":

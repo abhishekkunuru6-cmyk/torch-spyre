@@ -180,6 +180,16 @@ def plan_sliding_window(
     if left_pad % STICK or right_pad % STICK:
         return None
 
+    # An unpadded shape has no concatenate op for the decomposition to hang a
+    # spyre_hint(named_dims=...) on, and V — unlike Q and K, which are named on
+    # their scale multiplies — has no other op of its own.  Rather than
+    # introduce a no-op purely to carry a name, decline the shape; it keeps the
+    # unrolled path, which already handles it.  In practice this only excludes
+    # short-Q-against-a-long-cache shapes, where the window starts well inside
+    # the sequence (prefill has q_kv_offset == 0, hence always left_pad > 0).
+    if left_pad == 0 and right_pad == 0:
+        return None
+
     return SlidingWindowPlan(
         num_q_blocks=num_q_blocks,
         q_block=q_block,

@@ -680,16 +680,16 @@ def spyre__sdpa_overrideable(
     )
 
 
-def _pad_kv_sequence(t: torch.Tensor, plan: SlidingWindowPlan) -> torch.Tensor:
-    """Pad a ``[B, H, Lk, D]`` K/V tensor along the SEQUENCE axis.
+def _kv_pad_parts(t: torch.Tensor, plan: SlidingWindowPlan) -> list:
+    """The pieces to concatenate for a left/right-padded K/V tensor.
 
-    The causal window reaches back before the sequence for the first blocks, so
-    reading a constant-width window at ``base + i*q_block`` needs real memory
-    there.  Every padded position is masked (see the band mask), so the padding
-    is never read as data — zeros just make that obvious in a dump.
+    Kept separate from the concatenation so the zero blocks are built OUTSIDE
+    any ``spyre_hint(named_dims=...)`` scope.  A named_dims hint applies to
+    EVERY op traced in its scope, and a zero block's sequence axis is
+    ``left_pad`` (64), not ``padded_kv`` (320) — inside the scope it would
+    register KV=64 and, because ``_named_dims`` uses setdefault, the first
+    registration wins and the real size never lands.
     """
-    if not (plan.left_pad or plan.right_pad):
-        return t
     lead = t.shape[:-2]
     parts = []
     if plan.left_pad:
@@ -705,7 +705,7 @@ def _pad_kv_sequence(t: torch.Tensor, plan: SlidingWindowPlan) -> torch.Tensor:
                 *lead, plan.right_pad, t.shape[-1], dtype=t.dtype, device=t.device
             )
         )
-    return torch.cat(parts, dim=-2)
+    return parts
 
 
 def _sliding_window_attention_looped(
@@ -729,29 +729,42 @@ def _sliding_window_attention_looped(
     named by ``spyre_hint(named_dims=...)`` on the op that produces it — the
     route ``_graph_has_named_dims_hint`` exists for.  The sizes are registered
     by that pass, which runs before the sliding hint is parsed.
+
+    EVERY named_dims scope below wraps EXACTLY ONE op, whose output rank equals
+    the name count.  The hint applies to every op traced in its scope, and
+    ``_named_dims`` registers sizes with setdefault, so a scope containing ops
+    of different shapes lets the first one win: wrapping the whole pad helper
+    registered KV from a zero block's 64-row sequence axis instead of the
+    padded 320, and wrapping the GQA chain zipped 4 names against the rank-5
+    expand.  Both produced "window (128) <= dim_size (64)" at hint-parse time.
     """
     dtype, device = query.dtype, query.device
     seqlen_q = plan.num_q_blocks * plan.q_block
     seqlen_kv = plan.padded_kv - plan.left_pad - plan.right_pad
 
     def _prepare_kv(t: torch.Tensor) -> torch.Tensor:
-        """Pad, GQA-broadcast and pre-scale one of K/V, naming it as we go.
+        """Pad and GQA-broadcast one of K/V, naming each materializing op.
 
         All of it happens OUTSIDE the sliding scope — the arrangement the rank-4
-        probe validated, and it keeps these loop-invariant multiplies from being
-        redone every iteration.
+        probe validated, so the scope sees ordinary inputs.
         """
         head_name = "HKV" if expansion != 1 else "H"
-        with spyre_hint(named_dims=["B", head_name, "KV", "D"]):
-            t = _pad_kv_sequence(t, plan)
+        # Zero blocks built first, outside the scope: they are rank 4 like the
+        # cat but their sequence axis is left_pad, not padded_kv.
+        parts = _kv_pad_parts(t, plan)
+        if len(parts) > 1:
+            with spyre_hint(named_dims=["B", head_name, "KV", "D"]):
+                t = torch.cat(parts, dim=-2)
         if expansion != 1:
-            with spyre_hint(named_dims=["B", "H", "KV", "D"]):
-                t = (
-                    t.unsqueeze(2)
-                    .expand(-1, -1, expansion, -1, -1)
-                    .flatten(1, 2)
-                    .contiguous()
-                )
+            # The expand MATERIALIZES (rank 5); the flatten after it is a view
+            # that fuses downstream, so the rank-5 output is what there is to
+            # name.  unsqueeze stays outside — it is rank 5 too, but with a 1 in
+            # the expansion slot, and setdefault would register EXP=1 from it.
+            t5 = t.unsqueeze(2)
+            with spyre_hint(named_dims=["B", "HKV", "EXP", "KV", "D"]):
+                t5 = t5.expand(-1, -1, expansion, -1, -1)
+            # HKV*EXP == H, which _consume_names resolves by prefix product.
+            t = t5.flatten(1, 2)
         return t
 
     # scaling_factor is the FOURTH root of 1/head_dim and is applied to both
