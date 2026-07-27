@@ -194,11 +194,26 @@ class SwaShape:
                     f"{self.read_extent} — the slide model does not apply"
                 )
 
-    def satisfies_old_trip_count_rule(self) -> bool:
-        """Whether increment 2a's constraint holds — the blocker, quantified."""
-        if self.seqlen_kv % self.read_extent:
-            return False
-        return self.num_q_blocks == self.seqlen_kv // self.read_extent
+    def old_rule_verdict(self) -> tuple[bool, str]:
+        """Whether increment 2a's constraint holds, and which half fails if not.
+
+        The rule has two halves — ``window | dim_size`` (so the windows tile the
+        dim) and ``N == dim_size // window`` (so both coupled dims agree on the
+        trip count).  A shape can satisfy the counts and still fail on
+        divisibility, so the two are reported separately rather than collapsed
+        into one confusing "N == N -> VIOLATED".
+        """
+        divides = self.seqlen_kv % self.read_extent == 0
+        derived = self.seqlen_kv // self.read_extent
+        counts_agree = self.num_q_blocks == derived
+        if not divides:
+            return False, (
+                f"W={self.read_extent} does not divide Lkv={self.seqlen_kv} "
+                f"(remainder {self.seqlen_kv % self.read_extent})"
+            )
+        if not counts_agree:
+            return False, f"N={self.num_q_blocks} != Lkv//W={derived}"
+        return True, f"N == Lkv//W == {derived}"
 
     def describe(self) -> str:
         return (
@@ -395,11 +410,9 @@ def _report(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, shape: SwaShape
 ) -> tuple[torch.Tensor, bool]:
     """Print the constraint check, the target, and every diagnostic's distance."""
-    old_rule = shape.satisfies_old_trip_count_rule()
+    old_rule, why = shape.old_rule_verdict()
     print(
-        f"  increment-2a trip-count rule (N == Lkv//W): "
-        f"{shape.num_q_blocks} == {shape.seqlen_kv}//{shape.read_extent}"
-        f" == {shape.seqlen_kv // shape.read_extent} -> "
+        f"  increment-2a trip-count rule: {why} -> "
         f"{'holds' if old_rule else 'VIOLATED (blocker A)'}"
     )
 
@@ -565,7 +578,7 @@ def main() -> None:
     print("SUMMARY:")
     violations = 0
     for shape, ok in results:
-        old_rule = shape.satisfies_old_trip_count_rule()
+        old_rule, _why = shape.old_rule_verdict()
         violations += not old_rule
         print(
             f"  Lq={shape.seqlen_q:>4} Lkv={shape.seqlen_kv:>5} "
