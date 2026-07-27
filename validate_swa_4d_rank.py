@@ -136,13 +136,26 @@ def _swa(seqlen: int = 256, window: int = 128, head_dim: int = 64) -> SwaShape:
     )
 
 
+# Shape sizes are load-bearing here, not arbitrary.  Both failures the first HW
+# runs found were dim-identification AMBIGUITIES rather than slide problems, and
+# an ambiguity only exists when two dims share a size — so the sweep deliberately
+# includes colliding and non-colliding variants of each.
 SWEEP_SHAPES: tuple[Rank4Shape, ...] = (
-    # Unit batch/head: rank 4 in shape only, closest to the verified rank-2 run.
+    # B == H == 1: two size-1 leading dims, which _resize_device_layout cannot
+    # tell apart.  Degenerate (real models have many heads) but kept as the
+    # documented lower bound of what works.
     Rank4Shape(batch=1, heads=1, kv_heads=1, swa=_swa()),
     Rank4Shape(batch=1, heads=2, kv_heads=2, swa=_swa()),
     Rank4Shape(batch=2, heads=2, kv_heads=2, swa=_swa()),
-    Rank4Shape(batch=1, heads=4, kv_heads=2, swa=_swa()),  # GQA x2
-    Rank4Shape(batch=2, heads=4, kv_heads=2, swa=_swa()),  # GQA x2
+    Rank4Shape(batch=1, heads=4, kv_heads=2, swa=_swa()),  # GQA x2, B breaks the tie
+    # B == kv_heads == expansion == 2: every dim the same size.  This is the one
+    # that produced a wrong answer with the right loop structure.
+    Rank4Shape(batch=2, heads=4, kv_heads=2, swa=_swa()),  # GQA x2, all sizes 2
+    # Same GQA, but B != expansion.  If the collision hypothesis is right these
+    # pass while the one above fails; if they also fail, GQA is broken for
+    # batch > 1 generally and the size collision is a red herring.
+    Rank4Shape(batch=2, heads=8, kv_heads=2, swa=_swa()),  # GQA x4, B=2 != 4
+    Rank4Shape(batch=4, heads=4, kv_heads=2, swa=_swa()),  # GQA x2, B=4 != 2
     Rank4Shape(batch=1, heads=2, kv_heads=2, swa=_swa(seqlen=512, window=256)),
 )
 
@@ -470,6 +483,11 @@ def main() -> None:
         )
     n_pass = sum(1 for _, ok in results if ok)
     print(f"  {n_pass}/{len(results)} shapes")
+    print()
+    print("  Sizes are load-bearing: a dim-identification ambiguity exists only")
+    print("  when two dims share a size.  Compare B=2/KVH=2/exp=2 (all the same)")
+    print("  against B=2/exp=4 and B=4/exp=2 to tell a size collision apart from")
+    print("  GQA simply being broken for batch > 1.")
     if not args.compile:
         print()
         print("  Spec only — the 4-D CPU model agrees with 5a's verified rank-2")
