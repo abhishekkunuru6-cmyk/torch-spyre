@@ -532,6 +532,11 @@ def run_compile(shape: SwaShape, dump: bool) -> bool:
     pnd.name_tensor_dims(q_dev, ["QS", "D"])
     pnd.name_tensor_dims(k_dev, ["KV", "D"])
     pnd.name_tensor_dims(v_dev, ["KV", "D"])
+    # The mask must be named too.  Left unnamed it still worked, but only via
+    # the _untracked_ fallback happening to line up with the real dims — the
+    # slide it needs is the SAME one k and v get, so say so explicitly rather
+    # than rely on the coincidence.
+    pnd.name_tensor_dims(m_dev, ["QS", "KV"])
 
     before = snapshot()
     try:
