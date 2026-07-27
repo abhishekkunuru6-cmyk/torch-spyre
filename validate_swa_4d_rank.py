@@ -38,6 +38,18 @@ mechanism unknowns:
    rather than onto the tensor itself.  This is the piece most likely to break;
    `--sweep` includes expansion=2 shapes, and `--no-gqa` skips them.
 
+Both the body's shape and where the GQA expand sits deliberately MIRROR
+`decompositions.py`, because the first run of this probe diverged from it in two
+places and both diverged into failures that the real op does not have:
+
+  * `amax`/`sum` use no ``keepdim``; the result is unsqueezed at the point of
+    use.  With ``keepdim=True`` the reduction output is a rank-4
+    ``[B, H, Lq, 1]`` buffer, and when ``B == 1`` that leaves
+    ``_resize_device_layout`` two indistinguishable size-1 host dims to place —
+    it fails outright.  The real op reduces to rank 3 and never creates that
+    buffer.
+  * the GQA expand happens OUTSIDE the hint scope, as the real op does.
+
 The window arithmetic is imported from `validate_swa_real_shapes` rather than
 re-derived — the causal/non-causal range rounding is fiddly enough that having
 one implementation is worth the coupling, and 5a's version is the verified one.
@@ -321,6 +333,13 @@ def run_compile(shape: Rank4Shape, dump: bool) -> bool:
     expansion = shape.expansion
 
     def fn(q, k, v, mask):
+        # GQA expansion happens OUTSIDE the hint scope, matching the real
+        # decomposition (decompositions.py builds k_blk/v_blk before entering
+        # its spyre_hint blocks).  Inside the scope the expanded tensors are
+        # just ordinary inputs.
+        if expansion != 1:
+            k = k.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+            v = v.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         with spyre_hint(
             sliding={
                 "QS": {"window": swa.q_block, "stride": swa.q_block},
@@ -331,14 +350,16 @@ def run_compile(shape: Rank4Shape, dump: bool) -> bool:
                 },
             }
         ):
-            if expansion != 1:
-                # GQA: broadcast each kv head to its query heads BEFORE the
-                # matmul, exactly as the real decomposition does.
-                k = k.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-                v = v.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
             s = torch.matmul(q, k.transpose(-1, -2)) * swa.scale + mask
-            p = torch.exp(s - torch.amax(s, dim=-1, keepdim=True))
-            return torch.matmul(p, v) / torch.sum(p, dim=-1, keepdim=True)
+            # amax/sum WITHOUT keepdim, unsqueezed at the point of use — the
+            # real decomposition's formulation.  keepdim=True materializes a
+            # rank-4 [B, H, Lq, 1] reduction output, and when B == 1 that gives
+            # _resize_device_layout two indistinguishable size-1 host dims to
+            # place, which it cannot do (see issue #3116's stick-dim recovery).
+            m = torch.amax(s, dim=-1)
+            p = torch.exp(s - m.unsqueeze(-1))
+            denom = torch.sum(p, dim=-1)
+            return torch.matmul(p, v) / denom.unsqueeze(-1)
 
     device = torch.device("spyre")
     q_dev, k_dev, v_dev = q.to(device), k_pad.to(device), v_pad.to(device)
