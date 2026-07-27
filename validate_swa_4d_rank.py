@@ -322,8 +322,13 @@ def run_spec(shape: Rank4Shape) -> bool:
     return ok
 
 
-def run_compile(shape: Rank4Shape, dump: bool) -> bool:
-    """Compile the rank-4 body on device and check values + loop structure."""
+def run_compile(shape: Rank4Shape, dump: bool, gqa_naming: str = "explicit") -> bool:
+    """Compile the rank-4 body on device and check values + loop structure.
+
+    ``gqa_naming`` selects how the GQA-expanded k/v get their named dims:
+    ``"explicit"`` annotates the materialized result, ``"implicit"`` leaves it
+    to propagation (the configuration that produced ~1e9 errors at batch > 1).
+    """
     import torch_spyre  # noqa: F401
     import torch_spyre._inductor.propagate_named_dims as pnd
     from torch_spyre._inductor import config, spyre_hint
@@ -345,14 +350,34 @@ def run_compile(shape: Rank4Shape, dump: bool) -> bool:
     mask = build_mask(swa, padded_kv).to(torch.float16)
     expansion = shape.expansion
 
+    def _gqa_expand(t):
+        """Broadcast each kv head to its query heads, naming the result.
+
+        The expand rewrites the head dim from kv_heads to kv_heads*expansion.
+        Name propagation carries the SOURCE tensor's name list onto the derived
+        buffer and matches names to layout extents by product prefix
+        (_consume_names), so "HKV" (size kv_heads) no longer matches the new
+        head extent and the whole list shifts by an axis — that is the
+        `_untracked_N` warning, and it lands "KV" on the wrong dim, which the
+        slide then strides through.  Naming the materialized result explicitly
+        removes the guess.  ``.contiguous()`` inside the scope forces a rank-4
+        buffer for the hint to name, following the flash decomposition's
+        pattern in test_coarse_tile_e2e.py.
+        """
+        t = t.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+        if gqa_naming == "explicit":
+            with spyre_hint(named_dims=["B", "H", "KV", "D"]):
+                t = t.contiguous()
+        return t
+
     def fn(q, k, v, mask):
-        # GQA expansion happens OUTSIDE the hint scope, matching the real
+        # GQA expansion happens OUTSIDE the sliding scope, matching the real
         # decomposition (decompositions.py builds k_blk/v_blk before entering
         # its spyre_hint blocks).  Inside the scope the expanded tensors are
         # just ordinary inputs.
         if expansion != 1:
-            k = k.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-            v = v.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+            k = _gqa_expand(k)
+            v = _gqa_expand(v)
         with spyre_hint(
             sliding={
                 "QS": {"window": swa.q_block, "stride": swa.q_block},
@@ -444,6 +469,13 @@ def main() -> None:
     ap.add_argument(
         "--dump", action="store_true", help="print the full bundle.mlir as well"
     )
+    ap.add_argument(
+        "--gqa-naming",
+        choices=("explicit", "implicit"),
+        default="explicit",
+        help="name the GQA-expanded k/v explicitly (default) or leave it to "
+        "propagation ('implicit' reproduces the ~1e9 batch>1 failures)",
+    )
     args = ap.parse_args()
 
     shapes = (
@@ -470,7 +502,7 @@ def main() -> None:
     for shape in shapes:
         ok = run_spec(shape)
         if args.compile:
-            ok = run_compile(shape, dump=args.dump) and ok
+            ok = run_compile(shape, dump=args.dump, gqa_naming=args.gqa_naming) and ok
         results.append((shape, ok))
 
     print("=" * 78)
