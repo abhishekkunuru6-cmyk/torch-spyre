@@ -322,12 +322,13 @@ def run_spec(shape: Rank4Shape) -> bool:
     return ok
 
 
-def run_compile(shape: Rank4Shape, dump: bool, gqa_naming: str = "explicit") -> bool:
+def run_compile(shape: Rank4Shape, dump: bool, gqa_naming: str = "host") -> bool:
     """Compile the rank-4 body on device and check values + loop structure.
 
-    ``gqa_naming`` selects how the GQA-expanded k/v get their named dims:
-    ``"explicit"`` annotates the materialized result, ``"implicit"`` leaves it
-    to propagation (the configuration that produced ~1e9 errors at batch > 1).
+    ``gqa_naming`` selects where the GQA expand happens, which is the variable
+    under test: ``"host"`` expands before the graph so no named dim ever
+    changes size, ``"implicit"`` expands in-graph and lets propagation guess,
+    ``"explicit"`` adds a named_dims hint that turns out to fold away.
     """
     import torch_spyre  # noqa: F401
     import torch_spyre._inductor.propagate_named_dims as pnd
@@ -350,19 +351,26 @@ def run_compile(shape: Rank4Shape, dump: bool, gqa_naming: str = "explicit") -> 
     mask = build_mask(swa, padded_kv).to(torch.float16)
     expansion = shape.expansion
 
-    def _gqa_expand(t):
-        """Broadcast each kv head to its query heads, naming the result.
+    # "host" expands before the graph, so the compiled function never sees a
+    # view chain that resizes a named dim.  That is the isolation experiment:
+    # if batch>1 GQA passes here, the SLIDE is fine and the whole failure is
+    # name propagation through the expand.  repeat_interleave matches
+    # unsqueeze/expand/flatten's head order (h = kvh*expansion + e).
+    expand_on_host = gqa_naming == "host" and expansion != 1
+    if expand_on_host:
+        k_pad = k_pad.repeat_interleave(expansion, dim=1)
+        v_pad = v_pad.repeat_interleave(expansion, dim=1)
 
-        The expand rewrites the head dim from kv_heads to kv_heads*expansion.
-        Name propagation carries the SOURCE tensor's name list onto the derived
-        buffer and matches names to layout extents by product prefix
-        (_consume_names), so "HKV" (size kv_heads) no longer matches the new
-        head extent and the whole list shifts by an axis — that is the
-        `_untracked_N` warning, and it lands "KV" on the wrong dim, which the
-        slide then strides through.  Naming the materialized result explicitly
-        removes the guess.  ``.contiguous()`` inside the scope forces a rank-4
-        buffer for the hint to name, following the flash decomposition's
-        pattern in test_coarse_tile_e2e.py.
+    def _gqa_expand(t):
+        """Broadcast each kv head to its query heads, in-graph.
+
+        NOTE: ``gqa_naming="explicit"`` tried to name the result by wrapping a
+        ``.contiguous()`` in ``spyre_hint(named_dims=...)``.  It changed
+        nothing — identical errors to the digit, identical `_untracked_N`
+        warnings, identical bundle names — because the expand already
+        materializes through a clone, so the extra ``.contiguous()`` folded
+        away and the hint attached to an op that no longer existed.  Kept only
+        to document that the attempt was made and did not take.
         """
         t = t.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
         if gqa_naming == "explicit":
@@ -375,7 +383,7 @@ def run_compile(shape: Rank4Shape, dump: bool, gqa_naming: str = "explicit") -> 
         # decomposition (decompositions.py builds k_blk/v_blk before entering
         # its spyre_hint blocks).  Inside the scope the expanded tensors are
         # just ordinary inputs.
-        if expansion != 1:
+        if expansion != 1 and not expand_on_host:
             k = _gqa_expand(k)
             v = _gqa_expand(v)
         with spyre_hint(
@@ -402,7 +410,9 @@ def run_compile(shape: Rank4Shape, dump: bool, gqa_naming: str = "explicit") -> 
     device = torch.device("spyre")
     q_dev, k_dev, v_dev = q.to(device), k_pad.to(device), v_pad.to(device)
     m_dev = mask.to(device)
-    head_name = "H" if not shape.is_gqa else "HKV"
+    # Host-expanded k/v already carry the full head count, so they are named
+    # "H" like q — no dim changes size anywhere in the graph.
+    head_name = "H" if (not shape.is_gqa or expand_on_host) else "HKV"
     pnd.declare_tensor_dim("B", shape.batch)
     pnd.declare_tensor_dim("H", shape.heads)
     pnd.declare_tensor_dim("HKV", shape.kv_heads)
@@ -471,10 +481,13 @@ def main() -> None:
     )
     ap.add_argument(
         "--gqa-naming",
-        choices=("explicit", "implicit"),
-        default="explicit",
-        help="name the GQA-expanded k/v explicitly (default) or leave it to "
-        "propagation ('implicit' reproduces the ~1e9 batch>1 failures)",
+        choices=("host", "explicit", "implicit"),
+        default="host",
+        help="how the GQA expand is done: 'host' expands before the graph so no "
+        "named dim ever changes size (the isolation experiment); 'implicit' "
+        "expands in-graph and lets propagation guess (reproduces the ~1e9 "
+        "batch>1 failures); 'explicit' adds a named_dims hint that folds away "
+        "and changes nothing",
     )
     args = ap.parse_args()
 
