@@ -2382,12 +2382,6 @@ def _divide_reduction_ranges(
             f"(reduction_ranges has {len(reduction_ranges)} entries)"
         )
         if window is not None:
-            print(  # SWA-DEBUG
-                f"SWA-DEBUG _divide_reduction_ranges: dim {i} "
-                f"range {reduction_ranges[i]} -> window {window} "
-                f"loop_count={loop_count}",
-                flush=True,
-            )
             reduction_ranges[i] = sympy.Integer(window)
             continue
         r = reduction_ranges[i]

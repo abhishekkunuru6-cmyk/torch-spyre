@@ -718,13 +718,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                 )
             )
 
-        if any(e is not None for e in raw_read_extent):  # SWA-DEBUG
-            print(
-                f"SWA-DEBUG create_op_spec op={op}: raw_read_extent="
-                f"{raw_read_extent} raw_slide_stride={raw_slide_stride} "
-                f"sliding_by_sym={sliding_by_sym} tiled_syms={tiled_syms}",
-                flush=True,
-            )
         return OpSpec(
             op,
             is_reduction,

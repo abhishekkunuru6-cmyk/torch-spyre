@@ -532,12 +532,6 @@ def generate_sdsc(
     # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
         tiled_symbols = []
-    if sliding_symbols:  # SWA-DEBUG
-        print(
-            f"SWA-DEBUG generate_sdsc idx={idx} sliding_symbols={sliding_symbols} "
-            f"tiled_symbols={tiled_symbols}",
-            flush=True,
-        )
 
     out_idx = len(sdsc_spec.args) - 1
     core_id_to_wk_slice = {
@@ -838,16 +832,6 @@ def generate_sdsc(
                             # advance) is independent of it, so popping it breaks
                             # multi-stick reads (stick 1 lands short by the gap)
                             # while single-stick is unaffected.
-                            kept_backGap = tensor.backGap.get(s)
-                            print(  # SWA-DEBUG
-                                f"SWA-DEBUG override sym={s} "
-                                f"base_byte_stride={stride} -> {new_stride} "
-                                f"(read_extent={read_extent} "
-                                f"slide_stride={slide_stride}) "
-                                f"tensor.strides[s]={tensor.strides.get(s)} "
-                                f"kept_backGap={kept_backGap}",
-                                flush=True,
-                            )
                             stride = new_stride
                         strides_for_level[s] = stride
                         any_tiled = True

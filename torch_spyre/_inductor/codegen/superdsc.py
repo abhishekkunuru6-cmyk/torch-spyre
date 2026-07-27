@@ -491,13 +491,6 @@ def _create_sdsc_tensors(
 
             dim_coord = arg.device_coordinates[-stride_idx - 2]
             if not isinstance(dim_coord, IndirectAccess) and dev_dim_size > it_dim_size:
-                print(  # SWA-DEBUG
-                    f"SWA-DEBUG superdsc backGap: op={op_spec.op} dim={dim} "
-                    f"dev_dim_size={dev_dim_size} it_dim_size={it_dim_size} "
-                    f"strides_before={strides[dim]} scale={scales.get(dim)} "
-                    f"reduced={dim in reduced_dims}",
-                    flush=True,
-                )
                 dim_offset = int(dim_coord.as_coeff_Add()[0])
                 offsets[dim] = dim_offset * dim_device_stride
                 backGap[dim] = dev_dim_size - it_dim_size

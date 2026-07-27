@@ -586,14 +586,6 @@ def _append_sliding_hints(
                 f"divide dim_size ({dim_size}) for the partition+slide model."
             )
         num_tiles = dim_size // window
-        # SWA-DEBUG
-        print(
-            f"SWA-DEBUG sliding DimHint: name={name} split_count(num_tiles)="
-            f"{num_tiles} loop_var={coord_for_name.get(name)} read_extent={window} "
-            f"slide_stride={stride} is_reduction={name in reduction_dims} "
-            f"coord_for_name_keys={list(coord_for_name.keys())}",
-            flush=True,
-        )
         dim_hints.append(
             DimHint(
                 dim_names=[name],
@@ -616,17 +608,6 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             del op.work_div_loop_info  # type: ignore[attr-defined]
         dp = getattr(op, "_dim_prop_info", None)
         op_hints = get_op_hints(op) if dp and dp.loop_var_dims else {}
-        # SWA-DEBUG: trace where a sliding hint is lost.
-        _raw = get_op_hints(op)
-        if any("sliding" in h for h in _raw.values()):
-            print(
-                f"SWA-DEBUG op={op.get_operation_name()} HAS sliding annotation; "
-                f"dp={dp is not None} "
-                f"loop_var_dims={dict(dp.loop_var_dims) if dp else None} "
-                f"gate_passed={bool(op_hints)} "
-                f"reduction_named_dims={dp.reduction_named_dims if dp else None}",
-                flush=True,
-            )
         if not op_hints:
             op.dim_hints = []  # type: ignore[attr-defined]
             if dp is not None:
@@ -666,12 +647,6 @@ def _assign_dim_hints_impl(operations: list[Operation]) -> None:
             # exceeds slide_stride (the overlap).  Opt-in; the count-based path
             # below is unchanged for every existing hint.
             sliding = hint_dict.get("sliding")
-            if "sliding" in hint_dict:  # SWA-DEBUG
-                print(
-                    f"SWA-DEBUG detect op={op.get_operation_name()} "
-                    f"hint_id={hint_id} sliding={sliding}",
-                    flush=True,
-                )
             if sliding:
                 _append_sliding_hints(
                     sliding, hint_id, coord_for_name, reduction_dims, dim_hints
