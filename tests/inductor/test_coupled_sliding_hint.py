@@ -278,7 +278,7 @@ class TestComputeFullRangesSlidingOutput(unittest.TestCase):
         self.assertEqual(int(full[0]), QSEQ)
 
     def test_overlapping_output_slide_raises(self):
-        """Overlapping output tiles would double-write; reject, don't mis-size."""
+        """Overlapping output tiles span less than tile*count; reject, don't mis-size."""
         info = _coupled_loop_info()
         info.loop_slide_stride = [Q_BLOCK // 2]
         with self.assertRaises(NotImplementedError) as cm:

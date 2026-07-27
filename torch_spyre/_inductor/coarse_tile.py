@@ -1361,10 +1361,18 @@ def _compute_full_ranges(op: ComputedBuffer) -> list[Expr]:
     ranges by multiplying each tiled dimension back by its loop_count.
 
     That reconstruction assumes the tiles PARTITION the dim (span ==
-    tile * count).  A sliding output dim only satisfies this when it does not
-    overlap (slide_stride == read_extent); an overlapping output dim spans
-    less than tile * count AND has consecutive iterations writing the same
-    output elements, so it is rejected rather than silently mis-sized.
+    tile * count), which a sliding output dim satisfies only when it does not
+    overlap (slide_stride == read_extent).  An overlapping output dim writes a
+    span of slide_stride * (count - 1) + read_extent, strictly less than
+    tile * count.
+
+    Whether the overlap is SAFE depends on the rest of the level.  When another
+    output dim partitions alongside it (SWA's Q-block rows paired with sliding
+    KV score columns), consecutive tiles land on disjoint rows and the
+    overlapping column ranges never collide; when nothing separates them,
+    consecutive iterations genuinely write the same elements.  Distinguishing
+    the two needs the two-output-dims-per-level support that is not built yet,
+    so both are rejected here rather than silently mis-sized.
     """
     full_ranges = list(op.data.ranges)
     loop_info = op.loop_info
@@ -1378,10 +1386,11 @@ def _compute_full_ranges(op: ComputedBuffer) -> list[Expr]:
                 raise NotImplementedError(
                     f"coarse_tile: op {op.get_name()!r} level {lvl} slides "
                     f"OUTPUT dim(s) {dims} with overlap (stride "
-                    f"{slide_stride[lvl]} != window {read_extent[lvl]}); "
-                    "consecutive iterations would write the same output "
-                    "elements.  Sliding an output dim is only supported as a "
-                    "clean partition (stride == window)."
+                    f"{slide_stride[lvl]} != window {read_extent[lvl]}), so "
+                    "the written span is smaller than tile * count.  Sliding "
+                    "an output dim is only supported as a clean partition "
+                    "(stride == window) until a second partitioning output dim "
+                    "at the same level can be expressed."
                 )
         for d in dims:
             if 0 <= d < len(full_ranges):
