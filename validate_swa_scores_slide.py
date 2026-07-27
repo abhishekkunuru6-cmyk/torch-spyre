@@ -58,10 +58,11 @@ band that matches the reference exactly.
 
 So: a MATCH proves the band is correctly ALIGNED (the K read lands on the right
 columns and the result is stored at the right offset) — it does NOT prove the
-work was reduced.  Confirm the loop structure separately with --dump: expect one
-`scf.for` whose body is a single [64, D] x [D, W] matmul, not a [QSEQ, KVSEQ]
-one.  The stuck-KV and disjoint-KV diagnostics below DO separate numerically;
-they are the realistic failure modes.
+work was reduced.  ``--compile`` therefore ALSO checks the bundle structure
+(``swa_probe_bundle.structural_report``): one ``scf.for`` of num_tiles
+iterations with the compute inside it, rather than one full-size op.  Both have
+to hold for a PASS.  The stuck-KV and disjoint-KV diagnostics below separate
+numerically; they are the realistic alignment failure modes.
 
 Shape constraints (unchanged from increment 2)
 ----------------------------------------------
@@ -281,10 +282,12 @@ def run_spec(shape: Shape, self_check: bool) -> bool:
 
 
 def run_compile(shape: Shape, dump: bool) -> bool:
-    """Compile the coupled scores slide on device.  Fails until 3b lands."""
+    """Compile the coupled scores slide on device and check band + structure."""
     import torch_spyre  # noqa: F401
     import torch_spyre._inductor.propagate_named_dims as pnd
     from torch_spyre._inductor import config, spyre_hint
+
+    from swa_probe_bundle import dump_bundles, snapshot, structural_report
 
     print("=" * 78)
     print(f"  COMPILE  {shape.describe()}")
@@ -317,15 +320,17 @@ def run_compile(shape: Shape, dump: bool) -> bool:
     pnd.name_tensor_dims(q_dev, ["QS", "D"])
     pnd.name_tensor_dims(k_dev, ["KV", "D"])
 
+    before = snapshot()
     try:
         with config.patch({"lx_planning": True, "allow_all_ops_in_lx_planning": True}):
             got = torch.compile(fn)(q_dev, k_dev).to("cpu", torch.float32)
     except NotImplementedError as e:
-        print(f"  UNSUPPORTED (expected until 3b): {e}")
+        print(f"  UNSUPPORTED: {e}")
         return False
     except Exception as e:  # noqa: BLE001 — surface compile/codegen failures
         print(f"  COMPILE/RUN FAILED: {type(e).__name__}: {e}")
         return False
+    new_dirs = snapshot() - before
 
     ref = _report_refs(q, k, shape)
     got_band = extract_band(got, shape)
@@ -336,22 +341,26 @@ def run_compile(shape: Shape, dump: bool) -> bool:
         f"  max|got_band - diagonal_ref| = {max_err:.4f} -> "
         f"{'MATCH' if ok else 'MISMATCH'}"
     )
-    if ok:
-        print("  RESULT: the sliding KV read lands on correctly-ALIGNED score")
-        print("  columns.  Work reduction is NOT proven by this number — check")
-        print("  the bundle (--dump) for one scf.for over a [64,D]x[D,W] matmul.")
-    else:
+    if not ok:
         for name, alt in (
             ("stuck KV (slide dropped)", stuck_kv_band_reference(q, k, shape)),
             ("disjoint KV (stride ignored)", disjoint_kv_band_reference(q, k, shape)),
         ):
             if torch.allclose(got_band, alt, rtol=3e-2, atol=tol):
                 print(f"  RESULT: band matches the {name} reference.")
-                return ok
+                return False
         print("  RESULT: band matches NO reference — inspect the sdsc geometry.")
+
+    # Numbers only prove ALIGNMENT here (the band is a slice of the untiled
+    # product), so the loop structure is a separate, required check.
+    reduced = structural_report(new_dirs, shape.num_tiles)
     if dump:
-        print("  (--dump: re-run increment 2's bundle dump helper if needed)")
-    return ok
+        dump_bundles(new_dirs)
+    if ok and reduced:
+        print("  RESULT: score columns correctly aligned AND the work is tiled.")
+    elif ok:
+        print("  RESULT: score columns aligned, but the work was NOT reduced.")
+    return ok and reduced
 
 
 def main() -> None:
@@ -370,7 +379,9 @@ def main() -> None:
         action="store_true",
         help="also compile the coupled scores slide on device (needs HW)",
     )
-    ap.add_argument("--dump", action="store_true", help="note the bundle dump step")
+    ap.add_argument(
+        "--dump", action="store_true", help="print the full bundle.mlir as well"
+    )
     ap.add_argument(
         "--no-self-check",
         action="store_true",
