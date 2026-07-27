@@ -208,20 +208,10 @@ class TestSlidingWindowAttentionKernel(
                 ),
                 # Pushing further to trace whether the windowed op's speedup
                 # (1.65x at 2048) keeps growing or plateaus with sequence
-                # length.
-                "mha_prefill_causal_w64_4096": (
-                    cached_randn(
-                        (2, 4096, 32, 128), differentiation=1, dtype=torch.float16
-                    ).transpose(1, 2),
-                    cached_randn(
-                        (2, 4096, 32, 128), differentiation=2, dtype=torch.float16
-                    ).transpose(1, 2),
-                    cached_randn(
-                        (2, 4096, 32, 128), differentiation=3, dtype=torch.float16
-                    ).transpose(1, 2),
-                    64,
-                    True,
-                ),
+                # length. Prefill counterparts (mha_prefill_causal_w64_4096/8192)
+                # dropped — full O(L^2) SDPA CPU reference at these lengths made
+                # the test prohibitively slow; decode is always a single
+                # Q-block regardless of cache length, so it stays cheap.
                 "mha_decode_causal_w64_4096": (
                     cached_randn(
                         (2, 1, 32, 128), differentiation=1, dtype=torch.float16
@@ -231,19 +221,6 @@ class TestSlidingWindowAttentionKernel(
                     ).transpose(1, 2),
                     cached_randn(
                         (2, 4096, 32, 128), differentiation=3, dtype=torch.float16
-                    ).transpose(1, 2),
-                    64,
-                    True,
-                ),
-                "mha_prefill_causal_w64_8192": (
-                    cached_randn(
-                        (2, 8192, 32, 128), differentiation=1, dtype=torch.float16
-                    ).transpose(1, 2),
-                    cached_randn(
-                        (2, 8192, 32, 128), differentiation=2, dtype=torch.float16
-                    ).transpose(1, 2),
-                    cached_randn(
-                        (2, 8192, 32, 128), differentiation=3, dtype=torch.float16
                     ).transpose(1, 2),
                     64,
                     True,
