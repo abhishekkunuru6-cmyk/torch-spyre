@@ -819,14 +819,17 @@ def generate_sdsc(
                         # stays read_extent (re-sync marker v2).
                         if sliding_symbols and s in sliding_symbols:
                             read_extent, slide_stride = sliding_symbols[s]
-                            # EXPERIMENT: the base _tiled_byte_stride already
-                            # equals slide_stride (the backGap adjustment for
-                            # it_dim_size=read_extent produced it).  So do NOT
-                            # scale; only drop the intra-op backGap, which was
-                            # computed for a partition (next tile at base +
-                            # it_dim_size) and is wrong for a sliding read where
-                            # the affine stride owns the advance.
-                            new_stride = stride  # no scaling
+                            # SCALE the per-tile stride down to the slide.  The
+                            # base _tiled_byte_stride is the full TILE advance
+                            # (read_extent rows = 128 rows = 16384 bytes here);
+                            # scaling by slide_stride/read_extent gives the block
+                            # advance (64 rows = 8192 bytes) so consecutive reads
+                            # OVERLAP.  (Verified: 1 reduction-row = 64 elems =
+                            # 128 bytes in the stick layout, so 16384 B = 128
+                            # rows = a full tile = partition; 8192 B = 64 rows =
+                            # the intended slide.)  Exact int division: base is a
+                            # multiple of read_extent.
+                            new_stride = stride * slide_stride // read_extent
                             popped = tensor.backGap.pop(s, None)
                             print(  # SWA-DEBUG
                                 f"SWA-DEBUG override sym={s} "
