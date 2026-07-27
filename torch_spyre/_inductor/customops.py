@@ -819,6 +819,81 @@ def _(
 
 
 @torch.library.custom_op(
+    "spyre::sliding_window_band_mask", mutates_args=(), device_types="spyre"
+)
+def sliding_window_band_mask(
+    seqlen_q: int,
+    seqlen_kv: int,
+    left_pad: int,
+    right_pad: int,
+    q_kv_offset: int,
+    window_size: int,
+    is_causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the WHOLE sliding-window band over left/right-padded K/V, on CPU.
+
+    Shape: ``[1, 1, seqlen_q, left_pad + seqlen_kv + right_pad]``; 0.0 = keep,
+    -inf = masked.  Broadcasts over batch and heads.
+
+    The per-block ``sliding_window_block_mask`` covers one Q block of an
+    unpadded, clamped KV range.  The sliding decomposition needs the opposite:
+    one mask spanning every block, over PADDED K/V, so its KV axis is the same
+    named dim K and V slide along and iteration i reads exactly block i's band
+    out of it.
+
+    Padding columns are masked unconditionally.  That is not a detail — it is
+    what lets the loop read a constant-width window at a negative origin
+    without the padded rows ever reaching the result, which is the equivalence
+    the whole rewrite rests on.  A padding column at KV coordinate < 0 can
+    otherwise satisfy the causal test (``0 <= delta < window_size``) and leak
+    uninitialised data into the softmax.
+
+    Built entirely on CPU so the in-place ops stay opaque to torch.compile,
+    matching spyre.causal_mask's and sliding_window_block_mask's rationale.
+    The construction itself lives in swa_sliding.build_band_mask_cpu, which is
+    plain-CPU and therefore unit-testable — this op is registered for the spyre
+    device and cannot be called on CPU.
+    """
+    from .swa_sliding import build_band_mask_cpu
+
+    mask_cpu = build_band_mask_cpu(
+        seqlen_q,
+        seqlen_kv,
+        left_pad,
+        right_pad,
+        q_kv_offset,
+        window_size,
+        is_causal,
+        dtype,
+    )
+    return mask_cpu.to(device=device)
+
+
+@sliding_window_band_mask.register_fake
+def _(
+    seqlen_q: int,
+    seqlen_kv: int,
+    left_pad: int,
+    right_pad: int,
+    q_kv_offset: int,
+    window_size: int,
+    is_causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(
+        1,
+        1,
+        seqlen_q,
+        left_pad + seqlen_kv + right_pad,
+        dtype=dtype,
+        device=device,
+    )
+
+
+@torch.library.custom_op(
     "spyre::sliding_window_attention", mutates_args=(), device_types="spyre"
 )
 def sliding_window_attention(  # type: ignore[empty-body]
