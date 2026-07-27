@@ -53,6 +53,14 @@ ignore_work_division_hints: bool = (
 
 ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 
+# Lower sliding-window attention to ONE device loop with a sliding KV read
+# (spyre_hint(sliding=...)) instead of unrolling a Python loop over Q blocks
+# into N separate op groups.  Opt-in while it is being validated on hardware:
+# the unrolled path works today, and only shapes plan_sliding_window() accepts
+# take the new route even when this is on (batch == 1, whole Q blocks, an
+# affine per-block KV range) — everything else still falls back.
+swa_sliding_loop: bool = os.environ.get("SPYRE_SWA_SLIDING_LOOP", "0") == "1"
+
 # Per-pass operation logging for CustomPreSchedulingPasses.
 # Set to "all" or "1" to log after every pass, or a comma-separated list of
 # pass function names (e.g., "split_multi_ops,insert_restickify") to log only

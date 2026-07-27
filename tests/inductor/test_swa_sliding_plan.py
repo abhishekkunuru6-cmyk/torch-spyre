@@ -207,5 +207,40 @@ class TestBandMask(unittest.TestCase):
                 self.assertEqual(kept, abs(delta) < plan.window_size, f"delta {delta}")
 
 
+class TestDispatchGating(unittest.TestCase):
+    """The decomposition takes the sliding path only when it is meant to."""
+
+    def test_flag_defaults_off(self):
+        """Opt-in until validated on hardware; the unrolled path works today."""
+        from torch_spyre._inductor import config
+
+        self.assertFalse(config.swa_sliding_loop)
+
+    def test_plan_is_the_gate(self):
+        """With the flag on, the plan still decides — batch>1 must not slide."""
+        self.assertIsNotNone(plan_sliding_window(**PREFILL))
+        self.assertIsNone(plan_sliding_window(**{**PREFILL, "batch_size": 4}))
+
+    def test_padding_helper_matches_the_plan(self):
+        from torch_spyre._inductor.decompositions import _pad_kv_sequence
+
+        plan = plan_sliding_window(**PREFILL)
+        kv = torch.zeros(1, 2, plan_seqlen_kv(plan), 8)
+        padded = _pad_kv_sequence(kv, plan)
+        # Padding goes on the SEQUENCE axis, not the head axis.
+        self.assertEqual(padded.shape[-2], plan.padded_kv)
+        self.assertEqual(padded.shape[1], 2)
+
+    def test_padding_helper_is_identity_when_unneeded(self):
+        from torch_spyre._inductor.decompositions import _pad_kv_sequence
+
+        plan = plan_sliding_window(
+            batch_size=1, seqlen_q=64, seqlen_kv=512, window_size=128, is_causal=True
+        )
+        self.assertEqual((plan.left_pad, plan.right_pad), (0, 0))
+        kv = torch.zeros(1, 2, 512, 8)
+        self.assertIs(_pad_kv_sequence(kv, plan), kv)
+
+
 if __name__ == "__main__":
     unittest.main()

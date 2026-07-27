@@ -23,8 +23,10 @@ import torch._decomp as decomp
 
 from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
+from . import config
 from . import customops  # noqa: F401
 from . import spyre_hint
+from .swa_sliding import SlidingWindowPlan, plan_sliding_window
 from torch_spyre._C import DataFormats, get_device_dtype
 
 import threading
@@ -678,6 +680,133 @@ def spyre__sdpa_overrideable(
     )
 
 
+def _pad_kv_sequence(t: torch.Tensor, plan: SlidingWindowPlan) -> torch.Tensor:
+    """Pad a ``[B, H, Lk, D]`` K/V tensor along the SEQUENCE axis.
+
+    The causal window reaches back before the sequence for the first blocks, so
+    reading a constant-width window at ``base + i*q_block`` needs real memory
+    there.  Every padded position is masked (see the band mask), so the padding
+    is never read as data — zeros just make that obvious in a dump.
+    """
+    if not (plan.left_pad or plan.right_pad):
+        return t
+    lead = t.shape[:-2]
+    parts = []
+    if plan.left_pad:
+        parts.append(
+            torch.zeros(
+                *lead, plan.left_pad, t.shape[-1], dtype=t.dtype, device=t.device
+            )
+        )
+    parts.append(t)
+    if plan.right_pad:
+        parts.append(
+            torch.zeros(
+                *lead, plan.right_pad, t.shape[-1], dtype=t.dtype, device=t.device
+            )
+        )
+    return torch.cat(parts, dim=-2)
+
+
+def _sliding_window_attention_looped(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    plan: SlidingWindowPlan,
+    scaling_factor: float,
+    expansion: int,
+) -> torch.Tensor:
+    """Windowed attention as ONE device loop with a sliding KV read.
+
+    Replaces the Python unroll over Q blocks: the loop var partition-slides the
+    Q rows (window == stride == q_block) while it overlap-slides the KV window
+    (stride == q_block < read_extent), both under one hint scope.  Increments
+    1-5c validated that mechanism; 5a showed this constant-window form computes
+    bit-identically to the unrolled clamp-and-shrink loop.
+
+    Naming is in-graph.  ``name_tensor_dims`` is a driver-side API on real
+    tensors, and everything here is a graph value, so each tensor's dims are
+    named by ``spyre_hint(named_dims=...)`` on the op that produces it — the
+    route ``_graph_has_named_dims_hint`` exists for.  The sizes are registered
+    by that pass, which runs before the sliding hint is parsed.
+    """
+    dtype, device = query.dtype, query.device
+    seqlen_q = plan.num_q_blocks * plan.q_block
+    seqlen_kv = plan.padded_kv - plan.left_pad - plan.right_pad
+
+    def _prepare_kv(t: torch.Tensor) -> torch.Tensor:
+        """Pad, GQA-broadcast and pre-scale one of K/V, naming it as we go.
+
+        All of it happens OUTSIDE the sliding scope — the arrangement the rank-4
+        probe validated, and it keeps these loop-invariant multiplies from being
+        redone every iteration.
+        """
+        head_name = "HKV" if expansion != 1 else "H"
+        with spyre_hint(named_dims=["B", head_name, "KV", "D"]):
+            t = _pad_kv_sequence(t, plan)
+        if expansion != 1:
+            with spyre_hint(named_dims=["B", "H", "KV", "D"]):
+                t = (
+                    t.unsqueeze(2)
+                    .expand(-1, -1, expansion, -1, -1)
+                    .flatten(1, 2)
+                    .contiguous()
+                )
+        return t
+
+    # scaling_factor is the FOURTH root of 1/head_dim and is applied to both
+    # operands, so their product carries the full 1/sqrt(head_dim).  Splitting
+    # it keeps the intermediate out of fp16's overflow range; the unrolled path
+    # scales q and k the same way.
+    with spyre_hint(named_dims=["B", "H", "QS", "D"]):
+        q_scaled = query * scaling_factor
+    k_pad = _prepare_kv(key)
+    v_pad = _prepare_kv(value)
+    with spyre_hint(named_dims=["B", "H", "KV", "D"]):
+        k_scaled = k_pad * scaling_factor
+
+    # The FULL band over the padded range, not a per-block mask: its KV axis is
+    # the same named dim K and V slide along, so iteration i reads block i's
+    # band out of it.  A compact [Lq, W] mask cannot be added to the untiled
+    # carrier's full-width q @ kT (increment 5a).
+    with spyre_hint(named_dims=["ONE", "ONE", "QS", "KV"]):
+        band = torch.ops.spyre.sliding_window_band_mask(
+            seqlen_q,
+            seqlen_kv,
+            plan.left_pad,
+            plan.right_pad,
+            plan.q_kv_offset,
+            plan.window_size,
+            plan.is_causal,
+            dtype,
+            device,
+        )
+
+    with spyre_hint(
+        sliding={
+            # Q sets the trip count; KV only follows it (counts_tiles=False),
+            # because read_extent has no reason to tile the KV length — the
+            # constraint that made increment 5b necessary.
+            "QS": {"window": plan.q_block, "stride": plan.q_block},
+            "KV": {
+                "window": plan.read_extent,
+                "stride": plan.q_block,
+                "counts_tiles": False,
+            },
+        }
+    ):
+        scores = torch.matmul(q_scaled, k_scaled.transpose(-1, -2))
+        scores = scores + band
+        # amax/sum WITHOUT keepdim, unsqueezed at the point of use: keepdim=True
+        # materializes a rank-4 [B, H, Lq, 1] reduction output, which
+        # _resize_device_layout cannot place when another leading dim is also 1.
+        block_max = torch.amax(scores, dim=-1)
+        exp_scores = torch.exp(scores - block_max.unsqueeze(-1))
+        denominator = exp_scores.sum(dim=-1)
+        out = torch.matmul(exp_scores, v_pad)
+        return out / denominator.unsqueeze(-1)
+
+
 @register_spyre_decomposition([torch.ops.spyre.sliding_window_attention.default])
 def spyre_sliding_window_attention(
     query: torch.Tensor,
@@ -743,6 +872,24 @@ def spyre_sliding_window_attention(
     # add_causal_sliding_window_band in hf_common.py); decode (Lq=1) and
     # prefill (Lq=Lk) both fall out of the same formula.
     q_kv_offset = max_seqlen_kv - max_seqlen_q
+
+    # Sliding path: ONE device loop with a sliding KV read instead of the
+    # unroll below.  plan_sliding_window returns None for any shape it cannot
+    # express, so an unsupported shape silently keeps the unrolled path rather
+    # than failing (see swa_sliding for what is rejected and why).
+    if config.swa_sliding_loop:
+        plan = plan_sliding_window(
+            batch_size=batch_size,
+            seqlen_q=max_seqlen_q,
+            seqlen_kv=max_seqlen_kv,
+            window_size=window_size,
+            is_causal=is_causal,
+            q_block=q_block_size,
+        )
+        if plan is not None:
+            return _sliding_window_attention_looped(
+                query, key, value, plan, scaling_factor, expansion
+            )
 
     out_blocks = []
     for qi in range(num_q_blocks):
