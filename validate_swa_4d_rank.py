@@ -151,12 +151,19 @@ SWEEP_SHAPES: tuple[Rank4Shape, ...] = (
     # B == kv_heads == expansion == 2: every dim the same size.  This is the one
     # that produced a wrong answer with the right loop structure.
     Rank4Shape(batch=2, heads=4, kv_heads=2, swa=_swa()),  # GQA x2, all sizes 2
-    # Same GQA, but B != expansion.  If the collision hypothesis is right these
-    # pass while the one above fails; if they also fail, GQA is broken for
-    # batch > 1 generally and the size collision is a red herring.
+    # Same GQA, but B != expansion.  (Refuted the size-collision hypothesis:
+    # these fail too.)
     Rank4Shape(batch=2, heads=8, kv_heads=2, swa=_swa()),  # GQA x4, B=2 != 4
     Rank4Shape(batch=4, heads=4, kv_heads=2, swa=_swa()),  # GQA x2, B=4 != 2
     Rank4Shape(batch=1, heads=2, kv_heads=2, swa=_swa(seqlen=512, window=256)),
+    # NO GQA, at the B*H values where the GQA shapes fail.  Every passing shape
+    # so far has B*H <= 4 and every failing one B*H >= 8, which — under host
+    # expansion, where nothing GQA-shaped survives into the graph — would mean
+    # the variable was never GQA but the batched matmul's batch count.
+    #   (2, 4): B*H = 8 with B > 1
+    #   (1, 8): B*H = 8 with B == 1, separating "B*H" from "B>1 and H>2"
+    Rank4Shape(batch=2, heads=4, kv_heads=4, swa=_swa()),  # MHA, B*H = 8
+    Rank4Shape(batch=1, heads=8, kv_heads=8, swa=_swa()),  # MHA, B*H = 8, B=1
 )
 
 DEFAULT_SHAPE = SWEEP_SHAPES[1]
@@ -523,16 +530,18 @@ def main() -> None:
     for shape, ok in results:
         print(
             f"  B={shape.batch} H={shape.heads} KVH={shape.kv_heads} "
+            f"BxH={shape.batch * shape.heads:>3} "
+            f"{'GQA' if shape.is_gqa else 'MHA'} "
             f"Lq={shape.swa.seqlen_q:>4} win={shape.swa.window_size:>4}  "
             f"{'PASS' if ok else 'FAIL'}"
         )
     n_pass = sum(1 for _, ok in results if ok)
     print(f"  {n_pass}/{len(results)} shapes")
     print()
-    print("  Sizes are load-bearing: a dim-identification ambiguity exists only")
-    print("  when two dims share a size.  Compare B=2/KVH=2/exp=2 (all the same)")
-    print("  against B=2/exp=4 and B=4/exp=2 to tell a size collision apart from")
-    print("  GQA simply being broken for batch > 1.")
+    print("  Read the BxH column, not the GQA one.  Under --gqa-naming=host the")
+    print("  expand happens before the graph, so a GQA shape is structurally a")
+    print("  plain MHA shape by the time the compiler sees it.  If the MHA rows")
+    print("  at BxH=8 fail alongside the GQA ones, this was never a GQA bug.")
     if not args.compile:
         print()
         print("  Spec only — the 4-D CPU model agrees with 5a's verified rank-2")
