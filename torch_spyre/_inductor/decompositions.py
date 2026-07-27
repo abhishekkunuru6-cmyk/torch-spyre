@@ -830,7 +830,9 @@ def spyre_sliding_window_attention(
 
         with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
             with spyre_hint(tiles={"num_heads": max(1, num_heads // 4)}):
-                with spyre_hint(tiles={"kv_window": max(1, kv_len // kv_block_size)}):
+                with spyre_hint(
+                    tiles={"kv_window": max(1, -(-kv_len // kv_block_size))}
+                ):
                     with spyre_hint(work_div={"num_heads": 4, "kv_window": 8}):
                         scaled_k_blk = (
                             k_blk * scaling_factor
