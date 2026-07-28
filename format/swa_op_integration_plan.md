@@ -197,6 +197,64 @@ Discipline that worked for the prototype: **isolate each unknown in a
     5. Validate against `tests/inductor/test_sliding_window_attention.py` and
        the additive-mask SDPA path.
 
+  - [ ] **5e — CURRENT BLOCKER: op-group contiguity.** `coarse_tile` requires
+    every op sharing a hint scope to be **contiguous** in `graph.operations`;
+    anything unhinted landing in the middle splits the scope into two groups
+    over the same `hint_id` and `validate_coarse_tile_groups` rejects it.
+    Hit **twice**, by two different ops, for the same underlying reason —
+    Inductor schedules an op with no forced-early consumer wherever it likes,
+    and both times it chose "just before my first use", i.e. inside the loop
+    body:
+
+    - **V's pad chain** (fixed, `683d795`). K feeds the scores matmul (first op
+      in the scope) so it schedules early; V is not needed until the *second*
+      matmul at the end. Fixed by `cat([key, value], dim=1)` **before**
+      padding, so one shared buffer must be ready for K's use and carries V
+      along — slicing back out afterward is a view, not a deferrable chain.
+    - **The band mask** (OPEN). `op11: FallbackKernel` / `op12: MultiOutput`
+      land between the matmul (`op10`) and `scores + band` (`op13`). Cannot use
+      the same trick: the mask is built from plan *constants*, has **no tensor
+      input at all**, so there is nothing to merge it into. It was already
+      earliest-possible in Python source order and still landed late —
+      confirming source order does not drive schedule order.
+
+    Current attempt (`10ab9f8`, **UNVERIFIED — the run that was meant to test
+    it aborted on a failed `git pull` and silently tested the old code**):
+    pass `schedule_anchor=k_scaled`, a tensor the op ignores for values,
+    purely to create a dependency edge a custom op cannot optimize away.
+    Risk: this only guarantees *no earlier than* `k_scaled`, not *as early as*
+    — and every observation so far says the scheduler defers toward first use.
+    If the split persists at the same point, the fallback is building the mask
+    as ordinary Pointwise ops (`arange`/compare/`where`) **inside** the sliding
+    scope, which carries its own open question: `arange` has no tensor inputs
+    and `dim_hint` propagation flows through tensor data flow, so it is not
+    obvious `coarse_tile` would infer QS/KV tiling for it without explicit
+    naming.
+
+  - [ ] **5f — inner KV sweep (SCALABILITY GAP, not correctness).** The single
+    loop currently processes the **entire** `read_extent` in one shot: one
+    `[64, D] x [D, read_extent]` matmul and one softmax over the full width.
+    That reproduces the unrolled path's **outer** block-skip but **drops its
+    inner online-softmax sweep** (the old `spyre_hint(tiles={"kv_window":
+    ceil(kv_len/64)})` plus the `M` / `denominator` / `out_blk` accumulators).
+
+    `read_extent = 64 - floor((1 - window_size)/64) * 64`, so the per-iteration
+    scores intermediate grows with the window:
+
+    | window | read_extent | scores tile (B=1, H=8, fp16) |
+    |---:|---:|---:|
+    | 64 | 128 | ~131 KB |
+    | 128 | 192 | ~197 KB |
+    | **4096** (Gemma-3 default) | **4160** | **~4.3 MB** |
+
+    Correct at the small windows tested; **will not scale to production window
+    sizes** — this is exactly the "large-intermediate problem flash attention's
+    tiling exists to avoid" that the *unrolled* decomposition's own docstring
+    cites as the reason its inner sweep exists. Fixing it means nesting a
+    second tiling level with online-softmax accumulators *inside* the sliding
+    loop. Sequenced after 5e: no point nesting an inner loop inside an outer
+    loop that does not yet compile.
+
 ---
 
 ## 4. How to run (user, on the pod — no HW in the Claude sandbox)
@@ -293,3 +351,53 @@ backend fix. Worth filing on its own.
 Note that test file is not on this branch: added in `e22622b`, removed in
 `584a392`. It is the control that told us which GQA bug was whose, so it
 probably should not stay deleted.
+
+### 6.4 Main-side regression: #3248 breaks SWA decode at non-stick kv lengths
+
+`test_sliding_window_kernel_mha_decode_causal_w64` (B=2, Lq=1, **Lkv=257**,
+32 heads, window 64) fails at **90.9% mismatched elements** on any branch
+carrying current main. It passes on `swa-windowed-decomposition` only because
+that branch still sits on the older `e4cd21e`.
+
+**Bisected to `2365a59` — "fix(sdpa): mask exp padding lanes so unpadded kv
+seqlen doesn't produce inf" (#3248).** Not ours: reproduced with
+`propagate_named_dims.py`, `coarse_tile.py`, `spyre_kernel.py` and
+`loop_info.py` all reverted to main's versions, i.e. with none of the sliding
+work in the build. `SPYRE_SWA_SLIDING_LOOP` is off by default, so increment 5d
+is not involved either.
+
+*Mechanism.* `_get_coordinate_mask` used to mask a padded dim only when
+`arg.scales[dim] == -2` (the reduced stick dim). #3248 changed that to
+`== -2 or mask_pointwise`, so for `exp` EVERY padded dim is masked with `-inf`,
+unconditionally by op name. SWA's `exp` falls outside what that was tested
+against, in two ways the commit's own comments call out:
+
+> Multi-dim masking is UNTESTED. SDPA only pads the stick dim … treat
+> multi-padded-dim pointwise ops as unverified.
+>
+> Masking is unconditional by op-name, not gated on whether the output actually
+> feeds a contraction … TODO(consumer-gating).
+
+SWA's `exp_scores` feeds BOTH a reduction (`.sum(dim=-1)`) and a contraction
+(`matmul(exp_scores, v_blk)`), and it runs inside the `tiles={"kv_window": …}`
+coarse-tiled loop, so the mask extent `iteration_space[dim] - padding` is
+computed against a tiled iteration space rather than SDPA's untiled one. At
+Lkv=257 the decode block's kv_len is 65 (kv_start=192, kv_end=257) — 63 padding
+lanes in a 2-stick buffer.
+
+*Note this is the same ragged tail the ceil-div fix (`413eb3c`) addresses*, and
+the failure reproduces the pre-fix 90.9% signature exactly, so #3248 re-breaks
+the computation that fix protects, by a different route.
+
+The fix belongs in `superdsc.py` (the bandage is explicitly temporary — see
+#3290 for the principled replacement), not in the SWA decomposition. Repro:
+
+```bash
+python3 -m pytest tests/inductor/test_sliding_window_attention_kernel.py \
+    -k "mha_decode_causal_w64 and not 4096 and not 8192 and not long" -q
+```
+
+The stick-aligned decode cases (`_4096`, `_8192`, `_long`) all pass — only the
+non-stick-aligned 257 fails. Increment 5d's sliding path does NOT cover this
+shape either way: `plan_sliding_window` rejects `Lq=1` (not a whole Q block),
+so it falls back to the unrolled path and is neither helped nor hurt.
