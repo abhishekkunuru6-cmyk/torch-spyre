@@ -29,11 +29,27 @@ shared with others — do NOT put sliding work there).
   unit tests in `tests/inductor/test_coupled_sliding_hint.py` and the 202-test
   coarse-tiling suite green.
 
-**NOT done — the actual SWA op is UNCHANGED.** `spyre_sliding_window_attention`
-(`torch_spyre/_inductor/decompositions.py:681`) still runs the original
-Python-unrolled `for qi in range(num_q_blocks)` loop (N separate op-groups). The
-sliding hint is NOT wired into it. "Tests pass" = the *building block* works;
-the *payoff* (one sliding `scf.for` instead of the unroll) is not implemented.
+**IN PROGRESS — the op is now rewritten but NOT yet correct.**
+`spyre_sliding_window_attention` (`torch_spyre/_inductor/decompositions.py`)
+takes the sliding path via `_sliding_window_attention_looped` when
+`config.swa_sliding_loop` is set AND `plan_sliding_window` returns a plan;
+otherwise it falls back to the original Python-unrolled
+`for qi in range(num_q_blocks)` loop. As of this session the sliding path
+**compiles and executes** on HW for a power-of-two `padded_kv` but produces
+**44.2% wrong elements** — see 5h, the current blocker. The flag defaults OFF,
+so the default path is untouched.
+
+Status at a glance:
+
+| | state |
+|---|---|
+| sliding hint mechanism (inc 1–5c) | DONE, HW-verified |
+| op rewritten to one loop | DONE (behind flag) |
+| op-group contiguity (5e) | SOLVED — value dependency, not ordering edge |
+| `padded_kv` factorization (5g) | root-caused, **fix not written** |
+| numerics (5h) | **BROKEN — current blocker** |
+| inner KV sweep (5f) | not started (scalability) |
+| multi-core work division | **not started** (all runs `SENCORES=1`) |
 
 **The diagonal coupling that blocked this is now BUILT (increment 2).** A
 multi-entry `spyre_hint(sliding={...})` couples dims under one loop level with
@@ -88,6 +104,54 @@ index-dependent window slice — that is exactly the gap our sliding hint closes
 ONCE it supports the diagonal coupling.
 
 ---
+
+## 2b. The rewrite as it stands (read before changing it)
+
+New file `torch_spyre/_inductor/swa_sliding.py`: frozen `SlidingWindowPlan`
+(`num_q_blocks, q_block, read_extent, base_offset, left_pad, right_pad,
+padded_kv, q_kv_offset, window_size, is_causal`), `unclamped_kv_range`,
+`plan_sliding_window`, `build_band_mask_cpu`. New custom op
+`spyre::sliding_window_band_mask` builds the full band over padded K/V.
+
+```python
+k_pad = _prepare_kv(key, plan, expansion)      # zero blocks built OUTSIDE
+v_pad = _prepare_kv(value, plan, expansion)    # any hint scope
+
+with spyre_hint(named_dims=["ONE", "ONE", "QS", "KV"]):
+    band = torch.ops.spyre.sliding_window_band_mask(...)
+
+diag_col = plan.q_kv_offset + plan.left_pad
+zero_from_band = band[:, :, :1, diag_col : diag_col + 1]   # exactly 0.0
+v_probe = v_pad[:1, :1, :1, :1]
+
+with spyre_hint(named_dims=["B", "H", "QS", "D"]):
+    q_scaled = query * scaling_factor
+with spyre_hint(named_dims=["B", "H", "KV", "D"]):
+    k_scaled = k_pad * scaling_factor + zero_from_band * v_probe   # see 5e
+
+with spyre_hint(sliding={
+        "QS": {"window": plan.q_block,     "stride": plan.q_block},
+        "KV": {"window": plan.read_extent, "stride": plan.q_block,
+               "counts_tiles": False}}):
+    scores = torch.matmul(q_scaled, k_scaled.transpose(-1, -2))
+    scores = scores + band
+    block_max = torch.amax(scores, dim=-1)
+    exp_scores = torch.exp(scores - block_max.unsqueeze(-1))
+    denominator = exp_scores.sum(dim=-1)
+    out = torch.matmul(exp_scores, v_pad)
+    return out / denominator.unsqueeze(-1)
+```
+
+**Two invariants that are easy to break by accident:**
+
+1. **One op per `named_dims` scope.** `_named_dims` uses `setdefault`, so the
+   *first* op in a scope wins the name. Wrapping several differently-shaped ops
+   in one scope caused
+   `ValueError: spyre_hint(sliding=...) on 'KV': need 0 < window (128) <=
+   dim_size (64)` — a `[1,8,64,128]` zero-pad block registered `KV=64` before
+   the `cat` could register 320. Hence `_kv_pad_parts` builds zeros *outside*
+   the scopes.
+2. **`amax` without `keepdim`**, unsqueezed at point of use (5d item 3).
 
 ## 3. Next tasks (increment ladder)
 
@@ -197,7 +261,7 @@ Discipline that worked for the prototype: **isolate each unknown in a
     5. Validate against `tests/inductor/test_sliding_window_attention.py` and
        the additive-mask SDPA path.
 
-  - [ ] **5e — CURRENT BLOCKER: op-group contiguity.** `coarse_tile` requires
+  - [x] **5e — op-group contiguity (SOLVED).** `coarse_tile` requires
     every op sharing a hint scope to be **contiguous** in `graph.operations`;
     anything unhinted landing in the middle splits the scope into two groups
     over the same `hint_id` and `validate_coarse_tile_groups` rejects it.
@@ -218,18 +282,92 @@ Discipline that worked for the prototype: **isolate each unknown in a
       earliest-possible in Python source order and still landed late —
       confirming source order does not drive schedule order.
 
-    Current attempt (`10ab9f8`, **UNVERIFIED — the run that was meant to test
-    it aborted on a failed `git pull` and silently tested the old code**):
-    pass `schedule_anchor=k_scaled`, a tensor the op ignores for values,
-    purely to create a dependency edge a custom op cannot optimize away.
-    Risk: this only guarantees *no earlier than* `k_scaled`, not *as early as*
-    — and every observation so far says the scheduler defers toward first use.
-    If the split persists at the same point, the fallback is building the mask
-    as ordinary Pointwise ops (`arange`/compare/`where`) **inside** the sliding
-    scope, which carries its own open question: `arange` has no tensor inputs
-    and `dim_hint` propagation flows through tensor data flow, so it is not
-    obvious `coarse_tile` would infer QS/KV tiling for it without explicit
-    naming.
+    **What did NOT work.** A `schedule_anchor=k_scaled` argument (an ignored
+    tensor input, added purely to create an un-optimizable dependency edge)
+    and a separate `spyre::order_after` custom op. Both failed, and the reason
+    generalizes: an ordering edge makes the band a *sibling* of the matmul, not
+    a **predecessor of the op that consumes it**. `order_after` also broke
+    worse — being a `FallbackKernel`, `propagate_named_dims` cannot traverse it,
+    so QS/KV names stopped there, `_is_coupled_sliding_level` went false, the
+    reduction-accumulator path fired, and spliced buffers broke topological
+    order (`KeyError: 'op13'` in `Scheduler.compute_ancestors`).
+
+    **What worked — a value dependency, not an ordering hint.** Force the band
+    to be a genuine input to an op that is *already* early in the scope:
+
+    ```python
+    zero_from_band = band[:, :, :1, diag_col : diag_col + 1]   # exactly 0.0
+    v_probe = v_pad[:1, :1, :1, :1]
+    k_scaled = k_pad * scaling_factor + zero_from_band * v_probe
+    ```
+
+    `k_scaled` feeds the *first* matmul, so the band must be ready before the
+    scope opens. `diag_col = q_kv_offset + left_pad` is on the band's diagonal,
+    where the value is exactly `0.0` (verified across causal/non-causal and
+    several window sizes), so the term is numerically inert. `v_probe` drags
+    V's pad chain in by the same mechanism, which is why the earlier
+    `cat([key, value], dim=1)` merge (`683d795`) could be **reverted**.
+
+    Note the slice must be **indexed**, not reduced: `band.amax()` over a
+    rank-4 band reduces QS and KV simultaneously and raises `expected exactly
+    1 reduction variable, got {d1, d0}`.
+
+  - [x] **5g — `padded_kv` factorization (ROOT-CAUSED, fix not yet written).**
+    With contiguity solved, the two `seqlen 256` shapes still died at
+    `Unsupported coordinate expression 2*(Mod(c1, 20))/5`. This was
+    misdiagnosed twice (first as the doubled head axis from the K/V merge, then
+    as a naming gap) before a `pow2` test shape settled it:
+
+    | shape | `padded_kv` | factors | result |
+    |---|---:|---|---|
+    | `mha_prefill_causal_w64_b1` | 320 | 2⁶ × **5** | coordinate assertion |
+    | `mha_prefill_causal_w64_b1_pow2` | 256 | 2⁸ | **compiles + runs** |
+
+    `views.py` carries a `# TODO: handle non-unit fractions` for exactly this
+    (issue #1353): a `padded_kv` with an awkward factor produces a fractional
+    coordinate expression the backend rejects. **Fix:** round `padded_kv` up to
+    a friendly factorization inside `plan_sliding_window`. The extra columns
+    are masked by the band anyway, so this costs read bandwidth, not
+    correctness. Not a design flaw in the sliding approach — a shape
+    constraint.
+
+  - [ ] **5h — CURRENT BLOCKER: wrong numerics on the shape that runs.**
+    `mha_prefill_causal_w64_b1_pow2` executes end-to-end but reports
+    `Mismatched elements: 86975 / 196608 (44.2%)`, greatest abs diff 3.4296875
+    at `(0, 0, 188, 52)`.
+
+    `diagnose_swa_sliding_blocks.py` breaks that aggregate down **per Q block**
+    (B=1, H=8, Lq=Lkv=192, D=128, window=64 → 3 blocks, windows `[0, 64, 128]`,
+    `read_extent=128`). First run, max abs err per block:
+
+    | Q block | rows | vs `correct` |
+    |---:|---|---:|
+    | 0 | 0–63 | 2.5693 |
+    | 1 | 64–127 | 0.8586 |
+    | 2 | 128–191 | **0.0097** ← correct to fp16 precision |
+
+    **The last block is right and the error grows the further back you go.**
+    That is the decisive clue: "stuck at block 0" (the assumption driving every
+    earlier hypothesis) predicts the exact opposite gradient, so it is ruled
+    out. The read appears pinned at or near its *final* position for every
+    iteration.
+
+    The first run's `stuck`/`shifted` columns showed `nan` — an artifact of the
+    *diagnostic*, not the device: those references give some rows a window with
+    no valid column, so `softmax` over all `-inf` produced `nan`. Fixed
+    (`f9d1ecc`); fully-masked rows now resolve to 0. The reference set was also
+    replaced to probe the newly-indicated end of the range: `last` (read never
+    moved off its final position), `reversed` (slide runs backwards), `desync`
+    (data and band slide at different rates), plus `correct`/`unmasked`.
+    **Re-run is pending — the discriminating result is not in yet.**
+
+    Leading suspect, unconfirmed: the run warns
+    `buf17/buf8: loop var d1 has no named dim mapping -- using _untracked_192`
+    and `_untracked_256`, likewise `buf21/buf11`. Those are the QS and KV
+    extents reaching body tensors **without their names** — precisely the
+    condition under which the sliding hint would be silently dropped for those
+    buffers. Note 5d item 2 already flagged that 5c passed with unnamed mask
+    dims only because the `_untracked_` fallback happened to align.
 
   - [ ] **5f — inner KV sweep (SCALABILITY GAP, not correctness).** The single
     loop currently processes the **entire** `read_extent` in one shot: one
@@ -257,6 +395,44 @@ Discipline that worked for the prototype: **isolate each unknown in a
 
 ---
 
+## 3b. Why the single loop is worth it (measured, not assumed)
+
+`benchmark_sliding_window_attention.py`, windowed decomposition vs. the
+mask-based baseline:
+
+| case | speedup |
+|---|---:|
+| prefill 256 | 0.34x (slower) |
+| prefill 2048 | 1.84x |
+| prefill 4096 | 3.81x |
+| decode 4096 → 131072 | 3.24x → 5.80x → 16.17x → 32.86x → 65.65x → **129.72x** |
+
+The shape of that curve is what matters. Per-Q-block cost is essentially
+**constant** (1.44 / 1.27 / 1.30 ms at 256 / 2048 / 4096), and every `Lq=1`
+decode costs ~1.8 ms regardless of cache length. So:
+
+> runtime ≈ `num_q_blocks` × fixed per-kernel overhead
+
+The Python-unrolled loop emits `num_q_blocks` **separate device kernels**, so it
+pays that overhead N times. Collapsing to one `scf.for` attacks exactly the
+dominant term — which is why the 256 case is a *loss* (overhead dominates the
+tiny win) and the gap widens monotonically with sequence length.
+
+## 3c. Open gaps not yet on the increment ladder
+
+- **Work-division hints are absent from the sliding path.** The rewrite only
+  ever solved *block selection* (which KV window a Q block reads). It never
+  emits `tiles=` / `work_div=` for batch or heads, i.e. **multi-core work
+  division was never implemented**. This is invisible in every result recorded
+  in this document because **every run so far used `SENCORES=1`**. Any
+  benchmark or correctness claim at `SENCORES>1` is currently unsupported.
+- **Section 6.1 (batch>1, heads≥4 wrong results) remains OPEN and unexplained.**
+  The rewrite is scoped to `batch == 1` to avoid it, not because it is fixed.
+- **Issue draft for #3248 is written but NOT filed** —
+  `format/issue_sdpa_unaligned_kv.md`.
+
+---
+
 ## 4. How to run (user, on the pod — no HW in the Claude sandbox)
 
 ```bash
@@ -269,7 +445,19 @@ SENCORES=1 python validate_swa_diagonal_coupling.py --compile       # inc 2
 SENCORES=1 python validate_swa_scores_slide.py --compile            # inc 3
 SENCORES=1 python validate_swa_attention_body.py --compile          # inc 4
 SENCORES=1 python validate_swa_real_shapes.py --compile             # inc 5
+
+# The sliding rewrite is OFF by default; opt in per run.
+SENCORES=1 SPYRE_SWA_SLIDING_LOOP=1 \
+  python -m pytest tests/inductor/test_sliding_window_attention_kernel.py -k b1 -q
+SENCORES=1 python diagnose_swa_sliding_blocks.py                    # inc 5h
+python -m pytest tests/inductor/test_swa_sliding_plan.py -q          # no HW
 ```
+
+`config.swa_sliding_loop` (`SPYRE_SWA_SLIDING_LOOP=1`) gates the whole
+rewrite; with it unset the op runs the original unrolled loop, so nothing on
+this branch can regress the default path. `plan_sliding_window` returns `None`
+— i.e. falls back — for `batch_size != 1`, `seqlen_q % q_block`, a non-affine
+KV range, or `left_pad == 0 and right_pad == 0`.
 
 `--compile` on the increment 3+ probes also checks the bundle structure
 (`swa_probe_bundle.py`): a numeric MATCH alone does not prove work reduction.
