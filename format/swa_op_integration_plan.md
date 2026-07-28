@@ -36,8 +36,11 @@ takes the sliding path via `_sliding_window_attention_looped` when
 otherwise it falls back to the original Python-unrolled
 `for qi in range(num_q_blocks)` loop. As of this session the sliding path
 **compiles and executes** on HW for a power-of-two `padded_kv` but produces
-**44.2% wrong elements** — see 5h, the current blocker. The flag defaults OFF,
-so the default path is untouched.
+**44.2% wrong elements**. That aggregate has since been localized: **only head
+0 is wrong** — 22 of 24 (block, head) pairs match CPU to fp16 precision, so the
+sliding machinery itself is working. See 5h for the head table, the prime
+suspect and the one-line experiment to run first. The flag defaults OFF, so the
+default path is untouched.
 
 Status at a glance:
 
@@ -47,7 +50,7 @@ Status at a glance:
 | op rewritten to one loop | DONE (behind flag) |
 | op-group contiguity (5e) | SOLVED — value dependency, not ordering edge |
 | `padded_kv` factorization (5g) | root-caused, **fix not written** |
-| numerics (5h) | **BROKEN — current blocker** |
+| numerics (5h) | **current blocker — narrowed to HEAD 0 ONLY** (22/24 block-head pairs are correct; suspect the 5e hack's 1→8 head broadcast) |
 | inner KV sweep (5f) | not started (scalability) |
 | multi-core work division | **not started** (all runs `SENCORES=1`) |
 
@@ -361,13 +364,83 @@ Discipline that worked for the prototype: **isolate each unknown in a
     (data and band slide at different rates), plus `correct`/`unmasked`.
     **Re-run is pending — the discriminating result is not in yet.**
 
-    Leading suspect, unconfirmed: the run warns
+    **RESOLVED TO A SINGLE HEAD (2026-07-28) — start here next session.**
+    The per-head profile is decisive:
+
+    | block | h0 | h1 | h2 | h3 | h4 | h5 | h6 | h7 |
+    |---:|---:|---:|---:|---:|---:|---:|---:|---:|
+    | 0 | **2.569** | 0.008 | 0.005 | 0.004 | 0.009 | 0.007 | 0.009 | 0.008 |
+    | 1 | **0.859** | 0.004 | 0.005 | 0.004 | 0.005 | 0.004 | 0.004 | 0.006 |
+    | 2 | 0.004 | 0.004 | 0.004 | 0.007 | 0.006 | 0.010 | 0.005 | 0.005 |
+
+    **22 of 24 (block, head) pairs are correct to fp16 precision (≤0.010).
+    Only head 0 is wrong, and only in blocks 0 and 1.** The sliding read, the
+    windowing, the band mask and the softmax are therefore all WORKING — the
+    44.2% aggregate was one head in eight dragging the average. Every
+    hypothesis chased before this (stuck-at-zero, pinned-at-last, reversed,
+    desync, unmasked, padding) is dead; the block-level and row-level tables
+    only ever showed head 0's error because they max over heads.
+
+    Corroborating detail from the row profile: within block 0 the error does
+    **not** track the padding-column count (row 0 has 63 padding columns and
+    err 0.0020; row 3 has 60 and err 0.8238; row 63 has 0 and err 0.3724). So
+    padding handling is fine too.
+
+    *Prime suspect — the 5e contiguity hack, on the H-axis broadcast.* It is
+    the only construct in the rewrite that singles out index 0 of a leading
+    axis:
+
+    ```python
+    zero_from_band = band[:, :, :1, diag_col : diag_col + 1]   # [1, 1, 1, 1]
+    v_probe = v_pad[:1, :1, :1, :1]                            # [1, 1, 1, 1]
+    k_scaled = k_pad * scaling_factor + zero_from_band * v_probe
+    ```
+
+    `band` is `[1, 1, Lq, padded_kv]`, so its H extent is **1** while `k_pad`
+    has `H = 8`. The add therefore REQUIRES a 1→8 broadcast on the head axis.
+    If that broadcast is not materialized and the term lands on head 0 alone,
+    head 0's K is perturbed while heads 1–7 get clean `k_pad * scaling_factor`
+    — exactly the observed signature. (`zero_from_band` is exactly 0.0 in
+    *value*, so this is about where the term is APPLIED, not what it is.)
+
+    *Discriminating experiment, one line, run this first:* delete
+    `+ zero_from_band * v_probe` from `k_scaled` and re-run
+    `diagnose_swa_sliding_blocks.py`.
+
+    - head 0 becomes correct → confirmed; the hack is the bug. (The contiguity
+      error from 5e will very likely return, since that term is what orders
+      the band — that is expected, and is the thing to re-solve.)
+    - head 0 still wrong → the hack is exonerated and the fault is elsewhere;
+      go after head 0's K/V layout directly.
+
+    *Candidate fixes if confirmed*, in order of preference: (a) expand the
+    zero term to the full head extent explicitly
+    (`zero_from_band.expand(-1, num_heads, -1, -1)`) so no implicit 1→8
+    broadcast is needed; (b) source the probe from a tensor that already has
+    `H = num_heads` so the broadcast never arises; (c) find an ordering
+    construct that does not require indexing a leading axis at 0 at all.
+    Whichever is chosen, re-check that the band still lands **before** the
+    scope — the whole point of the term.
+
+    *Also worth re-testing once head 0 is fixed:* `batch > 1` with `heads >= 4`
+    (section 6.1). A leading-axis broadcast defect of this shape is a plausible
+    common cause, and 6.1 has been open and unexplained for a while.
+
+    Secondary observation, now much less likely to be the cause: the run warns
     `buf17/buf8: loop var d1 has no named dim mapping -- using _untracked_192`
     and `_untracked_256`, likewise `buf21/buf11`. Those are the QS and KV
-    extents reaching body tensors **without their names** — precisely the
-    condition under which the sliding hint would be silently dropped for those
-    buffers. Note 5d item 2 already flagged that 5c passed with unnamed mask
-    dims only because the `_untracked_` fallback happened to align.
+    extents reaching body tensors **without their names**. This was the leading
+    suspect before the head profile; it is demoted because a dropped sliding
+    hint would corrupt all eight heads equally, not one. Still worth cleaning
+    up — 5d item 2 already flagged that 5c passed with unnamed mask dims only
+    because the `_untracked_` fallback happened to align.
+
+    *Method note for the next session.* Four hypotheses were wrong before the
+    head profile landed, and every one of them was reached by reasoning about
+    aggregate or block-level numbers. The measurement that actually resolved
+    it — split the error along an axis where every slice runs the **identical**
+    program — cost one small function. Prefer that shape of experiment over
+    another round of candidate references.
 
   - [ ] **5f — inner KV sweep (SCALABILITY GAP, not correctness).** The single
     loop currently processes the **entire** `read_extent` in one shot: one
