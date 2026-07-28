@@ -824,15 +824,13 @@ def _sliding_window_attention_looped(
     seqlen_q = plan.num_q_blocks * plan.q_block
     seqlen_kv = plan.padded_kv - plan.left_pad - plan.right_pad
 
+    # Padded and, if needed, GQA-broadcast TOGETHER — see _prepare_kv_pair for
+    # why K and V cannot be prepared as two independent chains here.
+    k_pad, v_pad = _prepare_kv_pair(key, value, plan, expansion)
     # scaling_factor is the FOURTH root of 1/head_dim and is applied to both
     # operands, so their product carries the full 1/sqrt(head_dim).  Splitting
     # it keeps the intermediate out of fp16's overflow range; the unrolled path
     # scales q and k the same way.
-    with spyre_hint(named_dims=["B", "H", "QS", "D"]):
-        q_scaled = query * scaling_factor
-    # Padded and, if needed, GQA-broadcast TOGETHER — see _prepare_kv_pair for
-    # why K and V cannot be prepared as two independent chains here.
-    k_pad, v_pad = _prepare_kv_pair(key, value, plan, expansion)
     with spyre_hint(named_dims=["B", "H", "KV", "D"]):
         k_scaled = k_pad * scaling_factor
 
@@ -857,15 +855,25 @@ def _sliding_window_attention_looped(
     # and nothing else needs it -- so Inductor deferred it to just before that
     # use, landing its FallbackKernel between the scores matmul and the add and
     # splitting the sliding scope into two op-groups over one hint_id, which
-    # coarse_tile rejects.
+    # coarse_tile rejects.  order_after puts band UPSTREAM of the loop's first
+    # op instead:  band -> q_ordered -> q_scaled -> matmul.
     #
-    # Routing Q through order_after puts band UPSTREAM of the loop's first op:
-    #     band -> q_ordered -> matmul
-    # An earlier attempt passed k_scaled INTO the band op instead; that made
-    # band a sibling of the matmul (both merely needing k_scaled) and left
-    # their relative order just as free -- it changed nothing on hardware.
-    # Direction of the edge is the whole point.
-    q_ordered = torch.ops.spyre.order_after(q_scaled, [band])
+    # The ordering op MUST be followed by a named ComputedBuffer before the
+    # loop body reads it.  order_after lowers to a FallbackKernel, and
+    # propagate_named_dims cannot handle those ("unhandled operation type
+    # FallbackKernel") -- so names stop dead at its output.  Feeding the matmul
+    # directly from it cost every body op its QS/KV names, which in turn made
+    # _is_coupled_sliding_level false (it needs an extent on BOTH an output and
+    # a reduction dim), so _propagate_tiled_op stopped skipping the reduction
+    # accumulator path, and the buffers that path splices in broke topological
+    # order -- surfacing as KeyError in Inductor's compute_ancestors.
+    #
+    # Scaling Q AFTER the ordering edge fixes that for free: the multiply is a
+    # ComputedBuffer carrying its own named_dims hint, so it re-establishes the
+    # names the FallbackKernel dropped, and Q is scaled exactly once either way.
+    q_ordered = torch.ops.spyre.order_after(query, [band])
+    with spyre_hint(named_dims=["B", "H", "QS", "D"]):
+        q_scaled = q_ordered * scaling_factor
 
     with spyre_hint(
         sliding={
@@ -880,7 +888,7 @@ def _sliding_window_attention_looped(
             },
         }
     ):
-        scores = torch.matmul(q_ordered, k_scaled.transpose(-1, -2))
+        scores = torch.matmul(q_scaled, k_scaled.transpose(-1, -2))
         scores = scores + band
         # amax/sum WITHOUT keepdim, unsqueezed at the point of use: keepdim=True
         # materializes a rank-4 [B, H, Lq, 1] reduction output, which
