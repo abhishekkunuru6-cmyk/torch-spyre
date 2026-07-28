@@ -708,6 +708,90 @@ def _kv_pad_parts(t: torch.Tensor, plan: SlidingWindowPlan) -> list:
     return parts
 
 
+def _prepare_kv_pair(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    plan: SlidingWindowPlan,
+    expansion: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad and GQA-broadcast K and V TOGETHER, as one shared buffer.
+
+    Padding K and V as two SEPARATE chains (pad K, pad V independently) is
+    what the first hardware run of this decomposition actually did, and it
+    failed downstream — not at naming, at coarse_tile grouping:
+
+        coarse_tile: hint_id=0 appears in both group 0 and group 1.
+
+    K's chain feeds the FIRST op inside the sliding scope (the scores
+    matmul), so it has an early, forced consumer and schedules cleanly before
+    the scope starts.  V's chain has NO consumer until the SECOND matmul, near
+    the very end of the loop body — nothing forces it to schedule early, and
+    it has no dependency on anything K-related, so Inductor's scheduler is
+    free to place it anywhere valid in topological order.  On that run it
+    placed V's pad-and-cat ops BETWEEN the scores matmul and the softmax ops
+    that follow — splitting the sliding scope's contiguous op-group into two
+    separate runs of the same hint_id.  coarse_tile's validator correctly
+    rejects that: an unhinted "build once" buffer landing physically inside
+    what must be one loop body is not safe to codegen (it would either have
+    to execute once per iteration, wastefully rebuilding the padding, or
+    codegen would not know where to place it at all).
+
+    Concatenating K and V along the HEAD axis before padding turns two
+    independent chains into one.  There is then only ONE combined buffer for
+    the scheduler to place, and it MUST be ready before the scores matmul
+    (which needs K's half) — carrying V's half along for free, since slicing
+    it back out below is a plain view into memory that is already realized,
+    not a new independent chain the scheduler could defer.
+
+    Splitting AFTER any GQA broadcast (rather than broadcasting K and V
+    separately after an early split) keeps the two chains merged for as long
+    as possible, which is the property this whole restructuring is for.
+    """
+    # [B, 2*kv_heads, Lkv, D].  Deliberately unnamed: it is only consumed by
+    # _kv_pad_parts (which reads .shape at trace time, not through the
+    # named-dims mechanism) and folded into the padding cat below as the
+    # unpadded middle piece — the padding cat's OWN output is what gets named,
+    # exactly as the un-padded original key/value tensor never needed naming
+    # in the single-tensor version of this function.
+    kv = torch.cat([key, value], dim=1)
+
+    parts = _kv_pad_parts(kv, plan)
+    if len(parts) > 1:
+        # KVPAIR is a throwaway name for "2 * kv_heads (pre-GQA)" — used only
+        # within this function and never referenced again after the final
+        # slice below, so it cannot collide with "H"/"HKV" registered
+        # elsewhere.
+        with spyre_hint(named_dims=["B", "KVPAIR", "KV", "D"]):
+            kv = torch.cat(parts, dim=-2)  # [B, 2*kv_heads, padded_kv, D]
+
+    if expansion != 1:
+        # Expanding the COMBINED head axis expands each of K's and V's kv-head
+        # groups by `expansion` in the same pass, in the same [K's heads...,
+        # V's heads...] layout the initial cat established — so slicing at the
+        # midpoint below still cleanly separates K's fully-expanded heads from
+        # V's.  Rank-5 expand materializes; the flatten after it is a view
+        # that fuses downstream (same reasoning as the single-tensor version).
+        kv5 = kv.unsqueeze(2)
+        with spyre_hint(named_dims=["B", "KVPAIR", "EXP", "KV", "D"]):
+            kv5 = kv5.expand(-1, -1, expansion, -1, -1)
+        kv = kv5.flatten(1, 2)  # [B, 2*num_heads, padded_kv, D]
+
+    # By construction kv.shape[1] is always exactly 2x whatever the final
+    # per-tensor head count is (kv_heads with no GQA, num_heads once expanded)
+    # — the initial cat is symmetric and expand does not change that.  Slicing
+    # is a view; .contiguous() forces a real buffer so the scores/output
+    # matmuls each read an ordinary, independently addressable tensor rather
+    # than a strided view into the shared pair, and gives each half exactly
+    # one op to hang its own named_dims hint on — the same "one op, one hint,
+    # matching rank" rule the pad and expand steps above follow.
+    half = kv.shape[1] // 2
+    with spyre_hint(named_dims=["B", "H", "KV", "D"]):
+        k_pad = kv[:, :half].contiguous()
+    with spyre_hint(named_dims=["B", "H", "KV", "D"]):
+        v_pad = kv[:, half:].contiguous()
+    return k_pad, v_pad
+
+
 def _sliding_window_attention_looped(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -730,42 +814,15 @@ def _sliding_window_attention_looped(
     route ``_graph_has_named_dims_hint`` exists for.  The sizes are registered
     by that pass, which runs before the sliding hint is parsed.
 
-    EVERY named_dims scope below wraps EXACTLY ONE op, whose output rank equals
-    the name count.  The hint applies to every op traced in its scope, and
-    ``_named_dims`` registers sizes with setdefault, so a scope containing ops
-    of different shapes lets the first one win: wrapping the whole pad helper
-    registered KV from a zero block's 64-row sequence axis instead of the
-    padded 320, and wrapping the GQA chain zipped 4 names against the rank-5
-    expand.  Both produced "window (128) <= dim_size (64)" at hint-parse time.
+    EVERY named_dims scope wraps EXACTLY ONE op, whose output rank equals the
+    name count (see ``_prepare_kv_pair`` and the module-level comment on the
+    first hardware run's two distinct failures — one at hint-parsing from
+    violating this rule, one at coarse_tile grouping from padding K and V as
+    independent chains).
     """
     dtype, device = query.dtype, query.device
     seqlen_q = plan.num_q_blocks * plan.q_block
     seqlen_kv = plan.padded_kv - plan.left_pad - plan.right_pad
-
-    def _prepare_kv(t: torch.Tensor) -> torch.Tensor:
-        """Pad and GQA-broadcast one of K/V, naming each materializing op.
-
-        All of it happens OUTSIDE the sliding scope — the arrangement the rank-4
-        probe validated, so the scope sees ordinary inputs.
-        """
-        head_name = "HKV" if expansion != 1 else "H"
-        # Zero blocks built first, outside the scope: they are rank 4 like the
-        # cat but their sequence axis is left_pad, not padded_kv.
-        parts = _kv_pad_parts(t, plan)
-        if len(parts) > 1:
-            with spyre_hint(named_dims=["B", head_name, "KV", "D"]):
-                t = torch.cat(parts, dim=-2)
-        if expansion != 1:
-            # The expand MATERIALIZES (rank 5); the flatten after it is a view
-            # that fuses downstream, so the rank-5 output is what there is to
-            # name.  unsqueeze stays outside — it is rank 5 too, but with a 1 in
-            # the expansion slot, and setdefault would register EXP=1 from it.
-            t5 = t.unsqueeze(2)
-            with spyre_hint(named_dims=["B", "HKV", "EXP", "KV", "D"]):
-                t5 = t5.expand(-1, -1, expansion, -1, -1)
-            # HKV*EXP == H, which _consume_names resolves by prefix product.
-            t = t5.flatten(1, 2)
-        return t
 
     # scaling_factor is the FOURTH root of 1/head_dim and is applied to both
     # operands, so their product carries the full 1/sqrt(head_dim).  Splitting
@@ -773,8 +830,9 @@ def _sliding_window_attention_looped(
     # scales q and k the same way.
     with spyre_hint(named_dims=["B", "H", "QS", "D"]):
         q_scaled = query * scaling_factor
-    k_pad = _prepare_kv(key)
-    v_pad = _prepare_kv(value)
+    # Padded and, if needed, GQA-broadcast TOGETHER — see _prepare_kv_pair for
+    # why K and V cannot be prepared as two independent chains here.
+    k_pad, v_pad = _prepare_kv_pair(key, value, plan, expansion)
     with spyre_hint(named_dims=["B", "H", "KV", "D"]):
         k_scaled = k_pad * scaling_factor
 
