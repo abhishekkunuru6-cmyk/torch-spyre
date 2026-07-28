@@ -401,57 +401,6 @@ inplaceable_ops[torch.ops.spyre.overwrite_f.default] = InplaceableOp(
 )
 
 
-@torch.library.custom_op("spyre::order_after", mutates_args=(), device_types="spyre")
-def order_after(x: torch.Tensor, deps: list[torch.Tensor]) -> torch.Tensor:
-    """Return ``x``, but only after every tensor in ``deps`` is materialized.
-
-    A SCHEDULING primitive, not a numeric one: ``deps`` is never read.
-
-    coarse_tile requires every op sharing a ``spyre_hint`` scope to be
-    contiguous in ``graph.operations``; an unhinted op landing between them
-    splits the scope into two loop nests over one hint_id, which
-    ``validate_coarse_tile_groups`` rejects.  Buffers that are BUILT outside a
-    hinted loop but first USED inside it are the ones that break this: with no
-    consumer forcing them earlier, Inductor is free to place them anywhere
-    valid in topological order, and observed behaviour is that it defers them
-    to just before their first use -- i.e. into the middle of the loop body.
-
-    Two things have hit this in the sliding-window decomposition: V's padding
-    chain (fixed structurally, by concatenating K and V so K's early use drags
-    V along) and the band mask (no tensor input at all, so nothing to merge
-    it into).  The online-softmax accumulators an inner KV sweep needs --
-    ``M``, ``denominator``, ``out_blk``, all built by torch.full/zeros
-    outside the loop and first read inside it -- have exactly the same shape
-    of problem.
-
-    Making the dependency point the RIGHT WAY is the whole trick.  An earlier
-    attempt gave the band-mask op an unused tensor ARGUMENT (``k_scaled``),
-    which made band a SIBLING of the consuming matmul -- both merely required
-    k_scaled -- and left their relative order just as free as before; it
-    changed nothing on hardware.  What is needed is for the deferred buffer to
-    sit UPSTREAM of the loop's first op:
-
-        band -> order_after(q, [band]) -> matmul   (band must precede matmul)
-
-    A custom op is opaque to the compiler, so unlike an algebraic identity
-    (``+ 0 * dep``) this edge cannot be constant-folded or simplified away.
-
-    Cost: one clone of ``x``.  Cloning rather than returning ``x`` directly
-    keeps the op from returning one of its own inputs (an alias the custom-op
-    boundary does not promise to handle).  It runs once, outside the loop, and
-    could later be made free by lowering this to a no-op that only carries the
-    scheduling edge.
-    """
-    del deps  # scheduling-only; see docstring
-    return x.clone()
-
-
-@order_after.register_fake
-def _(x: torch.Tensor, deps: list[torch.Tensor]) -> torch.Tensor:
-    del deps
-    return torch.empty_like(x)
-
-
 @torch.library.custom_op("spyre::restickify", mutates_args=(), device_types="spyre")
 def restickify(  # type: ignore[empty-body]
     x: torch.Tensor,
@@ -910,10 +859,13 @@ def sliding_window_band_mask(
     This op has no tensor input, so nothing forces it to schedule early and
     Inductor defers it to just before its consumer -- inside the sliding
     loop's op-group, which coarse_tile rejects.  The caller fixes that with
-    ``spyre::order_after``; an earlier attempt that instead gave THIS op an
-    unused tensor argument did not work, because that made it a sibling of the
-    consuming matmul rather than a predecessor.  See ``order_after``'s
-    docstring.
+    making it a real dependency of ``k_scaled``, which the loop's first op
+    already forces early -- see the ordering comment in
+    ``_sliding_window_attention_looped``.  Two earlier attempts failed: giving
+    THIS op an unused tensor argument only made it a sibling of the consuming
+    matmul rather than a predecessor, and a dedicated ordering custom op
+    lowered to a FallbackKernel, which the naming and layout passes cannot
+    handle.
     """
     from .swa_sliding import build_band_mask_cpu
 

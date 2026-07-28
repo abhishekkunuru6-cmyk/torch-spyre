@@ -727,9 +727,9 @@ def _prepare_kv(
     scheduled into the middle of the loop body.  That worked for scheduling but
     the doubled head axis made the slice's index expression unrepresentable --
     "Unsupported coordinate expression 2*(Mod(c1, 20))/5", where 2/5 is
-    D/padded_kv and 20 is padded_kv/(2*heads).  ``spyre::order_after`` solves
-    the scheduling problem directly and without touching the layout, so the
-    merge is gone; see the call site.
+    D/padded_kv and 20 is padded_kv/(2*heads).  The scheduling problem it was
+    solving is handled at the call site instead, by making V a real
+    dependency of k_scaled, so the layout is left alone.
     """
     head_name = "HKV" if expansion != 1 else "H"
     parts = _kv_pad_parts(t, plan)
@@ -776,9 +776,8 @@ def _sliding_window_attention_looped(
     from the wrong op on the first hardware run.
 
     Ops built outside the loop but first used inside it must additionally be
-    forced early with ``spyre::order_after``, or Inductor defers them into the
-    middle of the loop body and coarse_tile refuses the split op-group; see the
-    ordering comment below.
+    forced early, or Inductor defers them into the middle of the loop body and
+    coarse_tile refuses the split op-group; see the ordering comment below.
     """
     dtype, device = query.dtype, query.device
     seqlen_q = plan.num_q_blocks * plan.q_block
@@ -786,12 +785,6 @@ def _sliding_window_attention_looped(
 
     k_pad = _prepare_kv(key, plan, expansion)
     v_pad = _prepare_kv(value, plan, expansion)
-    # scaling_factor is the FOURTH root of 1/head_dim and is applied to both
-    # operands, so their product carries the full 1/sqrt(head_dim).  Splitting
-    # it keeps the intermediate out of fp16's overflow range; the unrolled path
-    # scales q and k the same way.
-    with spyre_hint(named_dims=["B", "H", "KV", "D"]):
-        k_scaled = k_pad * scaling_factor
 
     # The FULL band over the padded range, not a per-block mask: its KV axis is
     # the same named dim K and V slide along, so iteration i reads block i's
@@ -810,39 +803,47 @@ def _sliding_window_attention_looped(
             device,
         )
 
-    # BOTH `band` and `v_pad` are built outside the loop but first used inside
-    # it -- band at `scores + band`, v_pad at the second matmul at the very end
-    # -- and nothing else needs either.  Inductor therefore defers both to just
-    # before their own first use, landing them INSIDE the loop body and
-    # splitting the sliding scope into two op-groups over one hint_id, which
-    # coarse_tile rejects.  K escapes this only because the scores matmul, the
-    # body's first op, forces it early.
+    # ORDERING, and why it is spelled this way.
     #
-    # order_after puts both upstream of the loop's first op:
-    #     band, v_pad -> q_ordered -> q_scaled -> matmul
+    # `band` and `v_pad` are both built outside the loop but first used INSIDE
+    # it -- band at `scores + band`, v_pad at the final matmul -- and nothing
+    # else needs either.  Inductor therefore defers both to just before their
+    # own first use, landing them in the middle of the loop body and splitting
+    # the sliding scope into two op-groups over one hint_id, which coarse_tile
+    # rejects.  Only K escapes, because the scores matmul (the body's first op)
+    # forces it early.
     #
-    # An earlier version instead concatenated K and V along the head axis so
-    # K's early use would drag V along.  It fixed the scheduling but the
-    # doubled head axis made the slice back apart unrepresentable
-    # ("Unsupported coordinate expression 2*(Mod(c1, 20))/5").  Ordering V
-    # explicitly does the same job without touching the layout.
+    # The fix is to make both real dependencies of k_scaled, which the matmul
+    # already forces early.  `band.amax()` is EXACTLY 0.0 by construction --
+    # in-band entries are 0.0 and everything else is -inf, and the diagonal
+    # (delta == 0) is always in band for causal and non-causal alike -- so the
+    # added term is exactly zero and the arithmetic is untouched.  The compiler
+    # cannot know that, so it cannot fold the dependency away, which is the
+    # whole point; `+ 0 * v_pad` WOULD be folded and would order nothing.
     #
-    # The ordering op MUST be followed by a named ComputedBuffer before the
-    # loop body reads it.  order_after lowers to a FallbackKernel, and
-    # propagate_named_dims cannot handle those ("unhandled operation type
-    # FallbackKernel") -- so names stop dead at its output.  Feeding the matmul
-    # directly from it cost every body op its QS/KV names, which in turn made
-    # _is_coupled_sliding_level false (it needs an extent on BOTH an output and
-    # a reduction dim), so _propagate_tiled_op stopped skipping the reduction
-    # accumulator path, and the buffers that path splices in broke topological
-    # order -- surfacing as KeyError in Inductor's compute_ancestors.
-    #
-    # Scaling Q AFTER the ordering edge fixes that for free: the multiply is a
-    # ComputedBuffer carrying its own named_dims hint, so it re-establishes the
-    # names the FallbackKernel dropped, and Q is scaled exactly once either way.
-    q_ordered = torch.ops.spyre.order_after(query, [band, v_pad])
+    # Two earlier attempts are worth not repeating.  Concatenating K and V
+    # along the head axis (so K's early use dragged V along) ordered correctly
+    # but made the slice back apart unrepresentable: "Unsupported coordinate
+    # expression 2*(Mod(c1, 20))/5".  A dedicated ordering custom op ordered
+    # correctly too, but lowers to a FallbackKernel, which propagate_named_dims
+    # cannot handle ("unhandled operation type FallbackKernel") -- costing the
+    # body its QS/KV names, which flipped _is_coupled_sliding_level to false,
+    # which re-enabled the reduction-accumulator path, whose spliced buffers
+    # broke topological order (KeyError in compute_ancestors) -- and once that
+    # was patched, its unnamed clone of Q hit the SAME coordinate assertion
+    # from the layout side.  Both attempts fought the backend; ordinary
+    # pointwise ops do not.
+    zero_from_band = band.amax()  # exactly 0.0; see above
+    v_probe = v_pad.amax()  # finite; only its dependency edge matters
+
+    # scaling_factor is the FOURTH root of 1/head_dim and is applied to both
+    # operands, so their product carries the full 1/sqrt(head_dim).  Splitting
+    # it keeps the intermediate out of fp16's overflow range; the unrolled path
+    # scales q and k the same way.
     with spyre_hint(named_dims=["B", "H", "QS", "D"]):
-        q_scaled = q_ordered * scaling_factor
+        q_scaled = query * scaling_factor
+    with spyre_hint(named_dims=["B", "H", "KV", "D"]):
+        k_scaled = k_pad * scaling_factor + zero_from_band * v_probe
 
     with spyre_hint(
         sliding={
