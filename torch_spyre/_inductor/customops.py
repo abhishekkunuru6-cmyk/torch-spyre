@@ -831,6 +831,7 @@ def sliding_window_band_mask(
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    schedule_anchor: torch.Tensor,
 ) -> torch.Tensor:
     """Build the WHOLE sliding-window band over left/right-padded K/V, on CPU.
 
@@ -855,9 +856,23 @@ def sliding_window_band_mask(
     The construction itself lives in swa_sliding.build_band_mask_cpu, which is
     plain-CPU and therefore unit-testable — this op is registered for the spyre
     device and cannot be called on CPU.
+
+    ``schedule_anchor`` is UNUSED for values -- see the caller in
+    decompositions.py for why it exists.  In one sentence: this op has no real
+    tensor input, so Inductor's scheduler is free to place it anywhere valid
+    in topological order, and on hardware it placed it immediately before its
+    sole consumer (`scores + band`), splitting the sliding hint's op-group in
+    two.  A custom op is opaque to the compiler -- it cannot prove an argument
+    is unused, so it cannot remove this dependency the way it could an
+    algebraic identity like ``+ 0 * x``.  Passing a tensor already forced to
+    schedule early (``k_scaled``) is an EXPERIMENT to see whether that alone
+    is enough to move this op earlier too; it may not be, if the scheduler's
+    policy is "no earlier than its inputs" rather than "as early as its
+    inputs allow".
     """
     from .swa_sliding import build_band_mask_cpu
 
+    del schedule_anchor  # scheduling-only; see docstring
     mask_cpu = build_band_mask_cpu(
         seqlen_q,
         seqlen_kv,
@@ -882,7 +897,9 @@ def _(
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    schedule_anchor: torch.Tensor,
 ) -> torch.Tensor:
+    del schedule_anchor
     return torch.empty(
         1,
         1,

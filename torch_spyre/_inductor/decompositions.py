@@ -840,6 +840,24 @@ def _sliding_window_attention_looped(
     # the same named dim K and V slide along, so iteration i reads block i's
     # band out of it.  A compact [Lq, W] mask cannot be added to the untiled
     # carrier's full-width q @ kT (increment 5a).
+    #
+    # schedule_anchor=k_scaled is an EXPERIMENT, not a confirmed fix.  On
+    # hardware this op's FallbackKernel landed immediately before its only
+    # consumer (`scores + band`, the second op inside the sliding scope),
+    # splitting the group the same way V's independent pad chain once did --
+    # but band has no real tensor input to merge into an already-early buffer
+    # the way V was merged into K's.  k_scaled is proven to schedule before
+    # the scope starts; passing it in (unused for values, see the op's
+    # docstring) creates a dependency edge a custom op call cannot have
+    # optimized away.  Whether that is enough to move the op earlier, rather
+    # than merely permit it to run no earlier than k_scaled while still
+    # deferring to right before its use, is what the next hardware run tells
+    # us -- if the group-1 split persists at the same point, this did not
+    # work and the mask needs to be built a different way (e.g. as ordinary
+    # Pointwise ops inside the sliding scope itself, which has its own
+    # unresolved question: whether coarse_tile's tiling of an op with no
+    # tensor inputs of its own -- arange -- correctly infers QS/KV without
+    # explicit naming, since dim_hints propagate through TENSOR data flow).
     with spyre_hint(named_dims=["ONE", "ONE", "QS", "KV"]):
         band = torch.ops.spyre.sliding_window_band_mask(
             seqlen_q,
@@ -851,6 +869,7 @@ def _sliding_window_attention_looped(
             plan.is_causal,
             dtype,
             device,
+            k_scaled,
         )
 
     with spyre_hint(
