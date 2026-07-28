@@ -814,12 +814,20 @@ def _sliding_window_attention_looped(
     # forces it early.
     #
     # The fix is to make both real dependencies of k_scaled, which the matmul
-    # already forces early.  `band.amax()` is EXACTLY 0.0 by construction --
-    # in-band entries are 0.0 and everything else is -inf, and the diagonal
-    # (delta == 0) is always in band for causal and non-causal alike -- so the
-    # added term is exactly zero and the arithmetic is untouched.  The compiler
-    # cannot know that, so it cannot fold the dependency away, which is the
-    # whole point; `+ 0 * v_pad` WOULD be folded and would order nothing.
+    # already forces early.
+    #
+    # The added term must be EXACTLY zero, and must not be foldable -- `+ 0 *
+    # v_pad` would be folded away and would order nothing.  A single band
+    # element does both: `band[..., diag]` is 0.0 by construction, because the
+    # diagonal (delta == 0) is in band for causal and non-causal alike and is
+    # inside the sequence for any valid q_kv_offset, while the compiler cannot
+    # know its value.  Multiplying it by any V element gives exactly 0.0 and
+    # pulls V in as a dependency too.
+    #
+    # Both are INDEXED, not reduced.  band.amax() would have been the obvious
+    # spelling but reduces over QS and KV at once, and the backend supports a
+    # single reduction variable ("expected exactly 1 reduction variable, got
+    # {d1, d0}").  Slicing keeps it pointwise.
     #
     # Two earlier attempts are worth not repeating.  Concatenating K and V
     # along the head axis (so K's early use dragged V along) ordered correctly
@@ -833,8 +841,12 @@ def _sliding_window_attention_looped(
     # was patched, its unnamed clone of Q hit the SAME coordinate assertion
     # from the layout side.  Both attempts fought the backend; ordinary
     # pointwise ops do not.
-    zero_from_band = band.amax()  # exactly 0.0; see above
-    v_probe = v_pad.amax()  # finite; only its dependency edge matters
+    # Column of the (q_row 0, kv delta 0) diagonal element, in PADDED
+    # coordinates: q_idx[0] == q_kv_offset, and k_idx[c] == c - left_pad, so
+    # c == q_kv_offset + left_pad gives delta == 0.
+    diag_col = plan.q_kv_offset + plan.left_pad
+    zero_from_band = band[:, :, :1, diag_col : diag_col + 1]  # exactly 0.0
+    v_probe = v_pad[:1, :1, :1, :1]  # value irrelevant; the edge is the point
 
     # scaling_factor is the FOURTH root of 1/head_dim and is applied to both
     # operands, so their product carries the full 1/sqrt(head_dim).  Splitting
