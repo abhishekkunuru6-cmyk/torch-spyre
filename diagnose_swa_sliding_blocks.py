@@ -163,6 +163,66 @@ def main() -> None:
     print("  wrong way; 'unmasked' that the band is not reaching the scores;")
     print("  'desync' that data and mask slide at different rates.")
 
+    row_profile(got, refs["correct"], plan)
+    head_profile(got, refs["correct"], plan)
+
+
+def row_profile(got, ref, plan):
+    """Per-row error against `correct`, next to that row's window geometry.
+
+    A block-level number cannot distinguish "the whole block is wrong" from
+    "only the rows near an edge are wrong".  For each row this prints the max
+    error over heads and D, the number of columns the band leaves unmasked,
+    and how many of those columns fall in the zero PADDING -- block 0 is the
+    only block whose window covers padding, and it is by far the worst, so
+    that correlation is the thing to confirm or kill.
+    """
+    err = (got - ref).abs().amax(dim=-1).amax(dim=1)[0]  # [LQ]
+
+    print()
+    print("per-row error vs 'correct'  (valid = unmasked cols, pad = of which padding)")
+    print(f"{'row':>5}  {'err':>9}  {'valid':>6}  {'pad':>4}   {'window (kv_abs)':>16}")
+    print("-" * 52)
+    for blk in range(plan.num_q_blocks):
+        lo = plan.padded_window_lo(blk)
+        cols = (lo + torch.arange(plan.read_extent)) - plan.left_pad
+        for r in range(blk * Q_BLOCK, (blk + 1) * Q_BLOCK):
+            delta = (r + plan.q_kv_offset) - cols
+            keep = (delta >= 0) & (delta < WINDOW) & (cols >= 0) & (cols < LKV)
+            in_pad = int(((cols < 0) & (delta >= 0) & (delta < WINDOW)).sum())
+            # Print every row near a block edge, else every 8th, to stay short.
+            edge = (r % Q_BLOCK) < 4 or (r % Q_BLOCK) >= Q_BLOCK - 4
+            if edge or r % 8 == 0:
+                rng = f"[{int(cols[0])},{int(cols[-1])}]"
+                print(
+                    f"{r:>5}  {err[r].item():>9.4f}  {int(keep.sum()):>6}  "
+                    f"{in_pad:>4}   {rng:>16}"
+                )
+        print("-" * 52)
+    print("  Error tracking 'pad' says the padding columns are not really zero or")
+    print("  not really masked.  Error tracking 'valid' says the softmax normalizer")
+    print("  is wrong.  Error flat across a block says the block's DATA is wrong.")
+
+
+def head_profile(got, ref, plan):
+    """Max error per (block, head) -- separates a data bug from a layout bug.
+
+    Every head runs the identical program on different data, so a real
+    addressing bug hits all heads about equally.  Error concentrated in a few
+    heads points instead at tensor layout or work division.
+    """
+    print()
+    print("max error per (block, head) vs 'correct'")
+    print(f"{'block':>5}  " + "  ".join(f"h{h:<5}" for h in range(H)))
+    print("-" * (7 + 7 * H))
+    for blk in range(plan.num_q_blocks):
+        sl = slice(blk * Q_BLOCK, (blk + 1) * Q_BLOCK)
+        cells = "  ".join(
+            f"{(got[0, h, sl] - ref[0, h, sl]).abs().max().item():<6.3f}"
+            for h in range(H)
+        )
+        print(f"{blk:>5}  {cells}")
+
 
 if __name__ == "__main__":
     main()
