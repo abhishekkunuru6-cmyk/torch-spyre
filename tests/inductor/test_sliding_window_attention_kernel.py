@@ -276,7 +276,6 @@ class TestSlidingWindowAttentionKernel(
                     True,
                 ),
             },
-            "expect_fail": ["gqa_decode_causal_w64"],
         },
     }
 
@@ -305,3 +304,4 @@ class TestSlidingWindowAttentionKernel(
         compare_with_cpu(
             fn, q, k, v, window_size, is_causal, enable_gqa, run_eager=False
         )
+
