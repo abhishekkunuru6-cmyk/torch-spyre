@@ -157,6 +157,32 @@ class TestSlidingWindowAttentionKernel(
                     64,
                     True,
                 ),
+                # Same as mha_prefill_causal_w64_b1 but seqlen 192, which makes
+                # padded_kv 256 (2^8) instead of 320 (2^6 * 5).  Diagnostic pair
+                # for the coordinate assertion the 320 shape hits:
+                #
+                #   Unsupported coordinate expression 2*(Mod(c1, 20))/5
+                #
+                # That is the 64-row padding block being cat'd into the padded
+                # K/V tensor, and the 5 in the expression is 320's odd factor --
+                # 5 does not divide 64, so the layout factorization has no clean
+                # mapping.  views.py flags this class as unimplemented
+                # ("TODO: handle non-unit fractions", issue #1353).  If this
+                # 2^8 shape passes while the 320 one fails, the blocker is that
+                # padded_kv must avoid awkward factors, not the sliding path.
+                "mha_prefill_causal_w64_b1_pow2": (
+                    cached_randn(
+                        (1, 192, 8, 128), differentiation=1, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 192, 8, 128), differentiation=2, dtype=torch.float16
+                    ).transpose(1, 2),
+                    cached_randn(
+                        (1, 192, 8, 128), differentiation=3, dtype=torch.float16
+                    ).transpose(1, 2),
+                    64,
+                    True,
+                ),
                 # MHA, decode (Lq=1, Lk=full cache) — the real hf-adapters call shape.
                 "mha_decode_causal_w64": (
                     cached_randn(
@@ -304,4 +330,3 @@ class TestSlidingWindowAttentionKernel(
         compare_with_cpu(
             fn, q, k, v, window_size, is_causal, enable_gqa, run_eager=False
         )
-
