@@ -25,6 +25,7 @@ from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
 from . import customops  # noqa: F401
 from . import spyre_hint
+from .swa_window_gather import plan_window_gather
 from torch_spyre._C import DataFormats, get_device_dtype
 
 import threading
@@ -676,6 +677,84 @@ def spyre__sdpa_overrideable(
         philox_offset,
         None,
     )
+
+
+@register_spyre_decomposition([torch.ops.spyre.gather_kv_window.default])
+def spyre_gather_kv_window(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    seqlen_q: int,
+    window_size: int,
+    num_heads: int,
+    q_block: int,
+    is_causal: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Gather each Q block's sliding window into one compact buffer.
+
+    Returns (k_win, v_win, band) with k_win/v_win [B, N*Hq, buffer_width, E]
+    and band [1, N, 1, q_block, buffer_width].
+
+    The folded axis is **block-major** (index n*Hq + h). Two things depend on
+    that and would silently produce wrong numbers under head-major:
+    splitting the axis back into (N, Hq) must be a free view, and the band
+    must broadcast across heads. The caller's query fold must match — see
+    format/swa_window_gather_plan.md section 4.
+
+    Route A: this is a decomposition, not a kernel. It lowers to per-block
+    slices plus a cat, which are paths that already work; a real gather
+    kernel is deferred until the copy is measured (layer B).
+    """
+    plan = plan_window_gather(
+        seqlen_q,
+        key.size(2),
+        window_size,
+        is_causal=is_causal,
+        q_block=q_block,
+    )
+    if plan is None:
+        raise Unsupported(
+            f"gather_kv_window: unsupported shape (seqlen_q={seqlen_q}, "
+            f"seqlen_kv={key.size(2)}, window_size={window_size}, "
+            f"is_causal={is_causal}) — caller must check plan_window_gather first"
+        )
+
+    expansion = num_heads // key.size(1)
+    read_starts = [plan.read_start(n) for n in range(plan.num_q_blocks)]
+
+    k_blocks = []
+    v_blocks = []
+    for read_start in read_starts:
+        stop = read_start + plan.buffer_width
+        k_slice = key[:, :, read_start:stop, :]
+        v_slice = value[:, :, read_start:stop, :]
+        # GQA-broadcast the window slice, never the full-length cache: the
+        # unrolled op learned the hard way that expanding first and slicing
+        # after leaves the stick-padding pass a consumer needing a small
+        # window out of a tensor it still considers full-length, which it
+        # cannot reconcile ("lower_pad_sequence: pad_extent=-129 ...").
+        if expansion != 1:
+            k_slice = (
+                k_slice.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+            )
+            v_slice = (
+                v_slice.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+            )
+        k_blocks.append(k_slice)
+        v_blocks.append(v_slice)
+
+    band = torch.ops.spyre.window_band_mask(
+        read_starts,
+        q_block,
+        plan.buffer_width,
+        seqlen_q,
+        key.size(2),
+        window_size,
+        is_causal,
+        key.dtype,
+        key.device,
+    )
+    return torch.cat(k_blocks, dim=1), torch.cat(v_blocks, dim=1), band
 
 
 @register_spyre_decomposition([torch.ops.spyre.sliding_window_attention.default])
