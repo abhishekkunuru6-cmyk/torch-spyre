@@ -129,7 +129,9 @@ to be subtly wrong, so increment 4 tests it explicitly.
 
 ```python
 k4, v4, band = torch.ops.spyre.gather_kv_window(key, value, ...)
-#   k4, v4 : [B, N*Hq, Wb, E]          band : [1, N, 1, q_block, Wb]
+#   k4   : [B, N*Hq, E, Wb]   already transposed — matmul it directly
+#   v4   : [B, N*Hq, Wb, E]
+#   band : [1, N, 1, q_block, Wb]
 
 q4 = torch.cat([query[:, :, n*qb:(n+1)*qb, :] for n in range(N)], dim=1)
 # M / denominator / output accumulators over [B, N*Hq, q_block, ...], as SDPA
@@ -138,7 +140,7 @@ with spyre_hint(tiles={"batch_size": max(1, B // 2)}):
   with spyre_hint(tiles={"num_heads": max(1, (N * Hq) // 4)}):
     with spyre_hint(tiles={"window_size": max(1, Wb // 64)}):   # was max_seqlen_kv
       with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
-          scores = torch.matmul(q4 * scale, (k4 * scale).transpose(-1, -2))
+          scores = torch.matmul(q4 * scale, k4 * scale)   # k4 already transposed
           scores = (scores.view(B, N, Hq, qb, Wb) + band).view(B, N * Hq, qb, Wb)
 
           block_max   = torch.amax(scores, dim=-1)
@@ -178,6 +180,25 @@ earned the hard way: expanding the full-length K/V and slicing afterwards
 feeds the stick-padding pass a consumer needing a small window out of a tensor
 it still thinks is full-length, which it cannot reconcile
 (`lower_pad_sequence: pad_extent=-129 ... original_size_dim=257`).
+
+**Two device constraints found by increment 4, both isolated by probes in
+`tests/inductor/test_swa_gather_diag.py`:**
+
+| construct | result |
+|---|---|
+| plain buffer → `transpose` → matmul | works (this is what SDPA does) |
+| `cat` → matmul | works |
+| **`cat` → `transpose` → matmul** | **`StopIteration` in `insert_restickify`** |
+| **expand → `cat`** | **zeroed slots** (GQA only; MHA has no expand) |
+| `cat` → expand | works |
+
+So the gather **cat-s last on the expand** and **transposes first on K**:
+transpose each slice, cat, then expand once. Both orders are layout-preserving
+(asserted on CPU), so this costs nothing semantically.
+
+The restickify one is a backend limitation, not something specific to SWA —
+`_create_restickify_node` cannot resolve a `cat` buffer's FX node when the
+consumer reaches it through a view. **Worth filing separately.**
 
 ## 7. Risks, in order
 

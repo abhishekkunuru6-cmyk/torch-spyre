@@ -945,9 +945,14 @@ def gather_kv_window(  # type: ignore[empty-body]
     """
     Gather each Q block's sliding window out of the KV cache.
 
-    key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win, band) where k_win and
-    v_win are [B, N*Hq, buffer_width, E] and band is
-    [1, N, 1, q_block, buffer_width].
+    key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win, band) where
+    k_win is [B, N*Hq, E, buffer_width] — already **transposed**, so the
+    caller matmuls it directly — v_win is [B, N*Hq, buffer_width, E], and
+    band is [1, N, 1, q_block, buffer_width].
+
+    K comes out transposed because transposing the gathered buffer *afterwards*
+    crashes insert_restickify (StopIteration: the cat buffer's FX node is not
+    in env). Transposing each slice before the cat avoids it entirely.
 
     N = number of Q blocks. The folded axis is **block-major**, index
     ``n*Hq + h``, so that splitting it back into (N, Hq) is a free view and the
@@ -988,9 +993,11 @@ def _(
             f"is_causal={is_causal}) — caller must check plan_window_gather first"
         )
     folded = plan.num_q_blocks * num_heads
-    window = key.new_empty((key.size(0), folded, plan.buffer_width, key.size(3)))
+    batch, _, _, head_dim = key.shape
+    k_win = key.new_empty((batch, folded, head_dim, plan.buffer_width))
+    v_win = key.new_empty((batch, folded, plan.buffer_width, head_dim))
     band = key.new_empty((1, plan.num_q_blocks, 1, q_block, plan.buffer_width))
-    return window, window.clone(), band
+    return k_win, v_win, band
 
 
 @torch.library.custom_op("spyre::prod_dim_int", mutates_args=(), device_types="spyre")

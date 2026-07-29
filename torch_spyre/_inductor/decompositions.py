@@ -692,8 +692,10 @@ def spyre_gather_kv_window(
     """
     Gather each Q block's sliding window into one compact buffer.
 
-    Returns (k_win, v_win, band) with k_win/v_win [B, N*Hq, buffer_width, E]
-    and band [1, N, 1, q_block, buffer_width].
+    Returns (k_win, v_win, band):
+      k_win : [B, N*Hq, E, buffer_width]   already TRANSPOSED, matmul directly
+      v_win : [B, N*Hq, buffer_width, E]
+      band  : [1, N, 1, q_block, buffer_width]
 
     The folded axis is **block-major** (index n*Hq + h). Two things depend on
     that and would silently produce wrong numbers under head-major:
@@ -736,8 +738,19 @@ def spyre_gather_kv_window(
     #
     # Index arithmetic is unchanged: cat gives n*Hkv + kvh, and the expand maps
     # that to (n*Hkv + kvh)*expansion + e == n*Hq + h, still block-major.
+    #
+    # K is transposed PER SLICE, before the cat, so the caller can matmul it
+    # directly. Transposing the cat result instead crashes insert_restickify
+    # with StopIteration -- it cannot find the cat buffer's FX node. Probes
+    # (test_swa_gather_diag.py) isolated this to the combination: a plain
+    # buffer through a transpose is fine, and a cat straight into a matmul is
+    # fine, but a cat consumed THROUGH a transpose is not. V needs no
+    # transpose, so it keeps the natural [.., buffer_width, E] layout.
     k_win = torch.cat(
-        [key[:, :, start : start + plan.buffer_width, :] for start in read_starts],
+        [
+            key[:, :, start : start + plan.buffer_width, :].transpose(-1, -2)
+            for start in read_starts
+        ],
         dim=1,
     )
     v_win = torch.cat(

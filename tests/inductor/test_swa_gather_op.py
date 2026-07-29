@@ -15,8 +15,10 @@
 """Correctness of spyre::gather_kv_window (increment 4).
 
 The op copies each Q block's sliding window out of the KV cache into one
-compact [B, N*Hq, buffer_width, E] buffer, folded **block-major** (index
-n*Hq + h), and emits the matching band mask.
+compact buffer, folded **block-major** (index n*Hq + h), and emits the
+matching band mask. K comes out already transposed
+([B, N*Hq, E, buffer_width]) so the caller can matmul it directly —
+transposing the gathered buffer afterwards crashes insert_restickify.
 
 The headline test here is the **fold-order contract**. If the gather emits
 head-major while the caller's query fold is block-major (or vice versa),
@@ -56,15 +58,20 @@ def _expand_kv(tensor: torch.Tensor, expansion: int) -> torch.Tensor:
     return tensor.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
 
-def _reference_window(cache: torch.Tensor, plan, num_heads: int) -> torch.Tensor:
-    """Block-major gather, built independently of the op under test."""
+def _reference_window(
+    cache: torch.Tensor, plan, num_heads: int, transpose: bool = False
+) -> torch.Tensor:
+    """Block-major gather, built independently of the op under test.
+
+    ``transpose`` mirrors the op emitting K already transposed.
+    """
     expansion = num_heads // cache.size(1)
     blocks = []
     for block_index in range(plan.num_q_blocks):
         start = plan.read_start(block_index)
         window = cache[:, :, start : start + plan.buffer_width, :]
-        blocks.append(_expand_kv(window, expansion))
-    return torch.cat(blocks, dim=1)
+        blocks.append(window.transpose(-1, -2) if transpose else window)
+    return _expand_kv(torch.cat(blocks, dim=1), expansion)
 
 
 def _reference_band(plan) -> torch.Tensor:
@@ -113,7 +120,7 @@ class TestGatherKVWindow(unittest.TestCase):
                 return torch.ops.spyre.gather_kv_window(
                     k, v, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
                 )[0]
-            return _reference_window(k, plan, HEADS)
+            return _reference_window(k, plan, HEADS, transpose=True)
 
         compare_with_cpu(fn, self._cache(1), self._cache(2), run_eager=False)
 
@@ -138,7 +145,7 @@ class TestGatherKVWindow(unittest.TestCase):
                 return torch.ops.spyre.gather_kv_window(
                     k, v, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
                 )[0]
-            return _reference_window(k, plan, HEADS)
+            return _reference_window(k, plan, HEADS, transpose=True)
 
         compare_with_cpu(
             fn, self._cache(1, kvheads=2), self._cache(2, kvheads=2), run_eager=False
@@ -170,7 +177,7 @@ class TestGatherKVWindow(unittest.TestCase):
                 return torch.ops.spyre.gather_kv_window(
                     k, v, 1, WINDOW, HEADS, 1, True
                 )[0]
-            return _reference_window(k, plan, HEADS)
+            return _reference_window(k, plan, HEADS, transpose=True)
 
         compare_with_cpu(fn, cache, cache, run_eager=False)
 
@@ -203,7 +210,7 @@ class TestFoldOrderContract(unittest.TestCase):
                     k, v, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
                 )
                 q4 = _fold_query(q, plan)
-                return torch.matmul(q4, k_win.transpose(-1, -2))
+                return torch.matmul(q4, k_win)
 
             per_block = []
             for n in range(plan.num_q_blocks):
