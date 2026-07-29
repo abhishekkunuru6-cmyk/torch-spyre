@@ -722,26 +722,31 @@ def spyre_gather_kv_window(
     expansion = num_heads // key.size(1)
     read_starts = [plan.read_start(n) for n in range(plan.num_q_blocks)]
 
-    k_blocks = []
-    v_blocks = []
-    for read_start in read_starts:
-        stop = read_start + plan.buffer_width
-        k_slice = key[:, :, read_start:stop, :]
-        v_slice = value[:, :, read_start:stop, :]
-        # GQA-broadcast the window slice, never the full-length cache: the
-        # unrolled op learned the hard way that expanding first and slicing
-        # after leaves the stick-padding pass a consumer needing a small
-        # window out of a tensor it still considers full-length, which it
-        # cannot reconcile ("lower_pad_sequence: pad_extent=-129 ...").
-        if expansion != 1:
-            k_slice = (
-                k_slice.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-            )
-            v_slice = (
-                v_slice.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-            )
-        k_blocks.append(k_slice)
-        v_blocks.append(v_slice)
+    # Cat the window slices FIRST, then GQA-broadcast the gathered buffer once.
+    # Two reasons, in order of how painfully they were learned:
+    #
+    # 1. Expanding per slice and cat-ing the results reads a stride-0 view into
+    #    a cat, which produced zeroed slots on device (increment 4, GQA only --
+    #    MHA has no expand so it passed).
+    # 2. The expand still must not see the FULL-LENGTH cache: the unrolled op
+    #    found that expanding first and slicing after leaves the stick-padding
+    #    pass a consumer needing a small window out of a tensor it still
+    #    considers full-length ("lower_pad_sequence: pad_extent=-129 ...").
+    #    Cat-ing first respects that -- the buffer is already windowed.
+    #
+    # Index arithmetic is unchanged: cat gives n*Hkv + kvh, and the expand maps
+    # that to (n*Hkv + kvh)*expansion + e == n*Hq + h, still block-major.
+    k_win = torch.cat(
+        [key[:, :, start : start + plan.buffer_width, :] for start in read_starts],
+        dim=1,
+    )
+    v_win = torch.cat(
+        [value[:, :, start : start + plan.buffer_width, :] for start in read_starts],
+        dim=1,
+    )
+    if expansion != 1:
+        k_win = k_win.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
+        v_win = v_win.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
     band = torch.ops.spyre.window_band_mask(
         read_starts,
@@ -754,7 +759,7 @@ def spyre_gather_kv_window(
         key.dtype,
         key.device,
     )
-    return torch.cat(k_blocks, dim=1), torch.cat(v_blocks, dim=1), band
+    return k_win, v_win, band
 
 
 @register_spyre_decomposition([torch.ops.spyre.sliding_window_attention.default])
