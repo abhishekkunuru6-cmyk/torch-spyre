@@ -185,17 +185,35 @@ the user runs anything marked **[HW]** on the pod.
 - [ ] **Inc 1 — `swa_window_gather.py` planning module.** Frozen
       `WindowGatherPlan` + `plan_window_gather()` returning `None` for every
       unsupported shape in §4. Pure arithmetic. Unit tests first, no HW.
-- [ ] **Inc 2 — CPU equivalence.** Prove the gathered-buffer model equals the
-      unrolled model at **exactly 0.000000** across a shape sweep. This is the
-      claim that licenses the whole approach; if it is not exact, the window
-      arithmetic is wrong and nothing downstream matters. No HW.
+- [ ] **Inc 2 — CPU equivalence.** Prove the gathered-buffer model computes the
+      same attention as the full masked reference, across a shape sweep. No HW.
+
+  ```
+Two claims, and it matters which is which:
+  
+  1. **Exact, and this is the real content.** For every query row, the set
+     of KV columns left unmasked inside the compact buffer is *identical*
+     to the set the full-width band mask leaves unmasked. This is a
+     combinatorial claim about the window arithmetic, so it is exactly
+     testable — no tolerance.
+  2. **Roundoff-level, in float64.** Output values agree to ~1e-14. This
+     cannot be bit-exact and should not be asserted as such: the gathered
+     softmax reduces `buffer_width` terms where the reference reduces
+     `seqlen_kv`, and although the extra entries are exact zeros, `sum`
+     blocks its reduction differently at different widths, so the nonzero
+   terms group differently.
+  
+  If claim 1 fails, the window arithmetic is wrong and nothing downstream
+  matters.
+
+  ```
 - [ ] **Inc 3 — the op.** `spyre::gather_kv_window` + fake + decomposition
       (route A). Compile-only first, then [HW] a single prefill shape.
 - [ ] **Inc 4 — wire it in.** `spyre_sliding_window_attention` takes the gather
       path when `config.swa_window_gather` is set and the plan is not `None`.
-      [HW] the `b1` prefill cases.
+    [HW] the `b1` prefill cases.
 - [ ] **Inc 5 — shape sweep.** [HW] `B>1`, GQA, decode. Band the failures rather
-      than chasing the first one. **Layer A is done when this sweep is green.**
+    than chasing the first one. **Layer A is done when this sweep is green.**
 
 ### Layer B — the copy, once the math is right ("worry about that later")
 
