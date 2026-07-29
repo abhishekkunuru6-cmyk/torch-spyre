@@ -47,6 +47,13 @@ max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
 # very small divisor when max_size has many of them.
 min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
 
+# Route spyre::sliding_window_attention through the gathered-window path:
+# copy each Q block's window into one compact buffer and attend against that,
+# instead of masking the full KV cache. Off by default -- with it unset the op
+# keeps the unrolled per-Q-block loop, so this cannot regress the default path.
+# Shapes the gather cannot express fall back regardless (plan_window_gather).
+swa_window_gather: bool = os.environ.get("SPYRE_SWA_WINDOW_GATHER", "0") == "1"
+
 ignore_work_division_hints: bool = (
     os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "1"
 )

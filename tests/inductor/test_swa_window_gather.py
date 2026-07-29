@@ -30,6 +30,7 @@ import pytest
 
 from torch_spyre._inductor.swa_window_gather import (
     WindowGatherPlan,
+    choose_q_block,
     plan_window_gather,
 )
 
@@ -220,6 +221,33 @@ class TestCoverage:
         plan = plan_window_gather(1, 4096, 64)
         assert plan is not None
         assert plan.row_window(0) == (4032, 4096)
+
+
+class TestChooseQBlock:
+    """Q block size must divide the query length exactly."""
+
+    def test_decode_takes_a_single_row(self):
+        # Lq=1 is not a multiple of 64; one row also has no intra-block stagger.
+        assert choose_q_block(1) == 1
+
+    @pytest.mark.parametrize("seqlen_q", [64, 128, 256, 512, 4096])
+    def test_stick_multiples_take_a_full_block(self, seqlen_q):
+        assert choose_q_block(seqlen_q) == STICK
+
+    @pytest.mark.parametrize("seqlen_q", [2, 63, 65, 100, 257])
+    def test_anything_else_falls_back(self, seqlen_q):
+        # q_block=1 would divide these, but that is one gather per query row.
+        assert choose_q_block(seqlen_q) is None
+
+    @pytest.mark.parametrize("seqlen_q", [0, -1])
+    def test_degenerate_lengths_fall_back(self, seqlen_q):
+        assert choose_q_block(seqlen_q) is None
+
+    def test_decode_buffer_is_exactly_the_window(self):
+        # The pairing that matters: q_block=1 -> no stagger -> Wb == W.
+        plan = plan_window_gather(1, 4096, 64, q_block=choose_q_block(1))
+        assert plan is not None
+        assert plan.buffer_width == 64
 
 
 class TestPlanIsImmutable:

@@ -25,7 +25,8 @@ from .constants import DEVICE_NAME, FP8_E4M3_MAX
 from .errors import Unsupported
 from . import customops  # noqa: F401
 from . import spyre_hint
-from .swa_window_gather import plan_window_gather
+from . import config
+from .swa_window_gather import WindowGatherPlan, choose_q_block, plan_window_gather
 from torch_spyre._C import DataFormats, get_device_dtype
 
 import threading
@@ -775,6 +776,127 @@ def spyre_gather_kv_window(
     return k_win, v_win, band
 
 
+def _window_gather_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    plan: WindowGatherPlan,
+    scaling_factor: float,
+    num_heads: int,
+) -> torch.Tensor:
+    """
+    Sliding-window attention over a compact gathered KV window.
+
+    Structurally spyre__sdpa_overrideable's body, with one substitution that
+    is the whole point: the tiled KV extent is the WINDOW (buffer_width)
+    rather than max_seqlen_kv, so the out-of-window scores are never computed
+    instead of being computed and masked.
+
+    There is no Python loop over Q blocks. The blocks ride the head axis
+    (block-major, index n*Hq + h), which makes them independent batch entries
+    of the matmul, so block n meets window n by ordinary batched-matmul
+    positional pairing. See format/swa_window_gather_plan.md sections 3-5.
+    """
+    batch_size = query.size(0)
+    head_dim = query.size(3)
+    num_blocks = plan.num_q_blocks
+    q_block = plan.q_block
+    buffer_width = plan.buffer_width
+    folded_heads = num_blocks * num_heads
+
+    k_win, v_win, band = torch.ops.spyre.gather_kv_window(
+        key,
+        value,
+        plan.seqlen_q,
+        plan.window_size,
+        num_heads,
+        q_block,
+        plan.is_causal,
+    )
+
+    # Fold the query the same way the gather folded K/V. Getting these out of
+    # step pairs the wrong window with the wrong head and returns wrong
+    # numbers with no error -- see TestFoldOrderContract.
+    q_folded = torch.cat(
+        [query[:, :, n * q_block : (n + 1) * q_block, :] for n in range(num_blocks)],
+        dim=1,
+    )
+
+    # Online-softmax accumulators, including SDPA's "sparse via reduction"
+    # construction. They stay correct whether or not the window tiling below
+    # actually produces a device loop: on a single pass M is -inf, so
+    # correction is exp(-inf) == 0 and the running terms drop out.
+    m_reduced = torch.full(
+        (batch_size, folded_heads, q_block, 64),
+        float("-inf"),
+        device=query.device,
+        dtype=query.dtype,
+    )
+    running_max = m_reduced.amax(dim=-1)
+
+    denominator_reduced = torch.zeros(
+        (batch_size, folded_heads, q_block, 64),
+        device=query.device,
+        dtype=query.dtype,
+    )
+    denominator = denominator_reduced.amax(dim=-1)
+
+    output = torch.zeros(
+        (batch_size, folded_heads, q_block, head_dim),
+        device=query.device,
+        dtype=query.dtype,
+    )
+
+    with spyre_hint(tiles={"batch_size": max(1, batch_size // 2)}):
+        with spyre_hint(tiles={"num_heads": max(1, folded_heads // 4)}):
+            with spyre_hint(tiles={"window_size": max(1, buffer_width // 64)}):
+                with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
+                    # k_win arrives transposed, so no transpose here: applying
+                    # one to the gathered buffer crashes insert_restickify.
+                    scores = torch.matmul(
+                        q_folded * scaling_factor, k_win * scaling_factor
+                    )  # batch, folded_heads, q_block, buffer_width
+
+                    # Splitting the folded axis back into (blocks, heads) is a
+                    # free view under block-major, and is what lets the band
+                    # stay one-per-block instead of one-per-(block, head).
+                    scores = (
+                        scores.view(
+                            batch_size, num_blocks, num_heads, q_block, buffer_width
+                        )
+                        + band
+                    ).view(batch_size, folded_heads, q_block, buffer_width)
+
+                    block_max = torch.amax(scores, dim=-1)
+                    max_running = torch.maximum(running_max, block_max)
+
+                    exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
+                    correction = torch.exp(running_max - max_running)
+
+                    denominator = torch.ops.spyre.copy_f(
+                        denominator * correction + exp_scores.sum(dim=-1),
+                        denominator,
+                    )
+                    output = torch.ops.spyre.copy_f(
+                        output * correction.unsqueeze(-1)
+                        + torch.matmul(exp_scores, v_win),
+                        output,
+                    )
+                    running_max = torch.ops.spyre.copy_f(max_running, running_max)
+
+    output = torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
+
+    # Unfold: block n's heads sit at [n*Hq, (n+1)*Hq), and its rows belong at
+    # [n*q_block, (n+1)*q_block) of the sequence.
+    return torch.cat(
+        [
+            output[:, n * num_heads : (n + 1) * num_heads, :, :]
+            for n in range(num_blocks)
+        ],
+        dim=2,
+    )
+
+
 @register_spyre_decomposition([torch.ops.spyre.sliding_window_attention.default])
 def spyre_sliding_window_attention(
     query: torch.Tensor,
@@ -840,6 +962,26 @@ def spyre_sliding_window_attention(
     # add_causal_sliding_window_band in hf_common.py); decode (Lq=1) and
     # prefill (Lq=Lk) both fall out of the same formula.
     q_kv_offset = max_seqlen_kv - max_seqlen_q
+
+    # Gathered-window path: attend against a compact per-block KV buffer
+    # instead of masking the full cache. Off unless SPYRE_SWA_WINDOW_GATHER=1,
+    # and any shape the gather cannot express exactly (choose_q_block or
+    # plan_window_gather returning None) keeps the unrolled path below rather
+    # than failing to compile.
+    if config.swa_window_gather:
+        gather_q_block = choose_q_block(max_seqlen_q)
+        if gather_q_block is not None:
+            gather_plan = plan_window_gather(
+                max_seqlen_q,
+                max_seqlen_kv,
+                window_size,
+                is_causal=is_causal,
+                q_block=gather_q_block,
+            )
+            if gather_plan is not None:
+                return _window_gather_attention(
+                    query, key, value, gather_plan, scaling_factor, num_heads
+                )
 
     out_blocks = []
     for qi in range(num_q_blocks):

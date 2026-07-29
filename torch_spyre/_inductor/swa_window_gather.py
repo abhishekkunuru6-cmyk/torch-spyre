@@ -117,6 +117,26 @@ def _required_width(
     return _ceil_stick(widest)
 
 
+def choose_q_block(seqlen_q: int) -> int | None:
+    """Pick the Q block size for a query length, or None if none fits.
+
+    The block slicing needs ``seqlen_q % q_block == 0`` exactly, so:
+
+      - ``seqlen_q == 1`` (decode) takes ``q_block = 1``. A single row has no
+        intra-block stagger, which is what makes ``buffer_width == W`` there
+        rather than ``W + q_block``.
+      - otherwise a whole number of sticks takes ``q_block = STICK``.
+      - anything else falls back. ``q_block = 1`` would technically divide any
+        length, but it would mean one gather per query row, which defeats the
+        point.
+    """
+    if seqlen_q == 1:
+        return 1
+    if seqlen_q > 0 and seqlen_q % STICK == 0:
+        return STICK
+    return None
+
+
 def plan_window_gather(
     seqlen_q: int,
     seqlen_kv: int,
