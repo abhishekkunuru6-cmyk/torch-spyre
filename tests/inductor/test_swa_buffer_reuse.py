@@ -57,7 +57,11 @@ HEADS = 8
 HEAD_DIM = 64
 SEQLEN = 512  # fixed, so only the window varies
 Q_BLOCK = 64
-WINDOWS = (64, 128, 192, 256)
+# Up to W=384: buffer_width must stay under seqlen_kv, and W=448 would give
+# 512. The upper end is the point -- the paths are within noise of each other
+# at small windows and only separate as the fallback accumulates distinct
+# block widths (W/64 + 1 of them, against the rolled path's one).
+WINDOWS = (64, 128, 192, 256, 320, 384)
 
 # One row of one window buffer, in bytes: K and V, fp16.
 BYTES_PER_WINDOW_ROW = 2 * BATCH * HEADS * HEAD_DIM * 2
