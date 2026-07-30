@@ -12,20 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Correctness of spyre::gather_kv_window (increment 4).
+"""Correctness of spyre::gather_kv_window (increment R3).
 
-The op copies each Q block's sliding window out of the KV cache into one
-compact buffer, folded **block-major** (index n*Hq + h), and emits the
-matching band mask. K comes out already transposed
-([B, N*Hq, E, buffer_width]) so the caller can matmul it directly —
-transposing the gathered buffer afterwards crashes insert_restickify.
+The op copies **one** Q block's sliding window out of the KV cache and emits
+the matching band. K comes out already transposed ([B, Hq, E, buffer_width])
+so the caller can matmul it directly.
 
-The headline test here is the **fold-order contract**. If the gather emits
-head-major while the caller's query fold is block-major (or vice versa),
-every slot pairs the wrong window with the wrong head — the graph still
-compiles and still runs, it just returns wrong numbers. That makes it the
-most dangerous way to get this subtly wrong, so it is tested directly rather
-than trusted.
+The block tests below drive every block of a plan and concatenate, which is
+also the shape of the loop the decomposition runs: block n reads
+plan.read_start(n) and nothing carries between iterations. Where the abandoned
+all-at-once gather needed a fold-order contract test -- a mismatch there paired
+the wrong window with the wrong head and returned wrong numbers with no error
+-- pairing is now positional by iteration and cannot be got out of step.
 
 Run:
     SENCORES=1 python3 -m pytest tests/inductor/test_swa_gather_op.py -v
@@ -35,7 +33,10 @@ import unittest
 
 import torch
 
-from torch_spyre._inductor.swa_window_gather import plan_window_gather
+from torch_spyre._inductor.swa_window_gather import (
+    check_window_read,
+    plan_window_gather,
+)
 from utils_inductor import cached_randn, compare_with_cpu
 
 BATCH = 1
@@ -58,52 +59,50 @@ def _expand_kv(tensor: torch.Tensor, expansion: int) -> torch.Tensor:
     return tensor.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
 
 
+def _gather_block(cache: torch.Tensor, plan, block_index: int, num_heads: int, which):
+    """Call the op for one block; ``which`` picks k_win (0) or v_win (1)."""
+    q_start, _ = plan.block_q_range(block_index)
+    return torch.ops.spyre.gather_kv_window(
+        cache,
+        cache,
+        plan.read_start(block_index),
+        plan.buffer_width,
+        num_heads,
+        plan.q_block,
+        plan.q_kv_offset + q_start,
+        plan.window_size,
+        True,
+    )[which]
+
+
 def _reference_window(
-    cache: torch.Tensor, plan, num_heads: int, transpose: bool = False
+    cache: torch.Tensor, plan, block_index: int, num_heads: int, transpose: bool = False
 ) -> torch.Tensor:
-    """Block-major gather, built independently of the op under test.
-
-    ``transpose`` mirrors the op emitting K already transposed.
-    """
-    expansion = num_heads // cache.size(1)
-    blocks = []
-    for block_index in range(plan.num_q_blocks):
-        start = plan.read_start(block_index)
-        window = cache[:, :, start : start + plan.buffer_width, :]
-        blocks.append(window.transpose(-1, -2) if transpose else window)
-    return _expand_kv(torch.cat(blocks, dim=1), expansion)
+    """One block's window, built independently of the op under test."""
+    start = plan.read_start(block_index)
+    window = cache[:, :, start : start + plan.buffer_width, :]
+    if transpose:
+        window = window.transpose(-1, -2)
+    return _expand_kv(window, num_heads // cache.size(1))
 
 
-def _reference_band(plan) -> torch.Tensor:
-    """[1, N, 1, q_block, Wb] additive band, built from the plan's row windows."""
+def _reference_band(plan, block_index: int) -> torch.Tensor:
+    """[1, 1, q_block, Wb] additive band, built from the plan's row windows."""
     columns = torch.arange(plan.buffer_width)
-    blocks = []
-    for block_index in range(plan.num_q_blocks):
-        start = plan.read_start(block_index)
-        q_start, _ = plan.block_q_range(block_index)
-        rows = []
-        for offset in range(plan.q_block):
-            low, high = plan.row_window(q_start + offset)
-            allowed = (columns + start >= low) & (columns + start < high)
-            rows.append(allowed)
-        blocks.append(torch.stack(rows))
-    stacked = torch.stack(blocks)
+    start = plan.read_start(block_index)
+    q_start, _ = plan.block_q_range(block_index)
+    rows = []
+    for offset in range(plan.q_block):
+        low, high = plan.row_window(q_start + offset)
+        rows.append((columns + start >= low) & (columns + start < high))
+    stacked = torch.stack(rows)
     band = torch.zeros(stacked.shape, dtype=torch.float16)
     band.masked_fill_(~stacked, float("-inf"))
-    return band.unsqueeze(0).unsqueeze(2)
-
-
-def _fold_query(query: torch.Tensor, plan) -> torch.Tensor:
-    """Block-major query fold — must match the gather's order."""
-    blocks = [
-        query[:, :, n * plan.q_block : (n + 1) * plan.q_block, :]
-        for n in range(plan.num_q_blocks)
-    ]
-    return torch.cat(blocks, dim=1)
+    return band.unsqueeze(0).unsqueeze(0)
 
 
 class TestGatherKVWindow(unittest.TestCase):
-    """The gather itself: does it copy the right rows into the right slots?"""
+    """The gather itself: does it copy the right rows into the buffer?"""
 
     def _cache(self, differentiation: int, kvheads: int = HEADS) -> torch.Tensor:
         return cached_randn(
@@ -116,11 +115,14 @@ class TestGatherKVWindow(unittest.TestCase):
         plan = _plan()
 
         def fn(k, v):
+            blocks = range(plan.num_q_blocks)
             if k.device.type == "spyre":
-                return torch.ops.spyre.gather_kv_window(
-                    k, v, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
-                )[0]
-            return _reference_window(k, plan, HEADS, transpose=True)
+                windows = [_gather_block(k, plan, n, HEADS, 0) for n in blocks]
+            else:
+                windows = [
+                    _reference_window(k, plan, n, HEADS, transpose=True) for n in blocks
+                ]
+            return torch.cat(windows, dim=1)
 
         compare_with_cpu(fn, self._cache(1), self._cache(2), run_eager=False)
 
@@ -128,11 +130,12 @@ class TestGatherKVWindow(unittest.TestCase):
         plan = _plan()
 
         def fn(k, v):
+            blocks = range(plan.num_q_blocks)
             if k.device.type == "spyre":
-                return torch.ops.spyre.gather_kv_window(
-                    k, v, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
-                )[1]
-            return _reference_window(v, plan, HEADS)
+                windows = [_gather_block(v, plan, n, HEADS, 1) for n in blocks]
+            else:
+                windows = [_reference_window(v, plan, n, HEADS) for n in blocks]
+            return torch.cat(windows, dim=1)
 
         compare_with_cpu(fn, self._cache(1), self._cache(2), run_eager=False)
 
@@ -141,11 +144,14 @@ class TestGatherKVWindow(unittest.TestCase):
         plan = _plan()
 
         def fn(k, v):
+            blocks = range(plan.num_q_blocks)
             if k.device.type == "spyre":
-                return torch.ops.spyre.gather_kv_window(
-                    k, v, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
-                )[0]
-            return _reference_window(k, plan, HEADS, transpose=True)
+                windows = [_gather_block(k, plan, n, HEADS, 0) for n in blocks]
+            else:
+                windows = [
+                    _reference_window(k, plan, n, HEADS, transpose=True) for n in blocks
+                ]
+            return torch.cat(windows, dim=1)
 
         compare_with_cpu(
             fn, self._cache(1, kvheads=2), self._cache(2, kvheads=2), run_eager=False
@@ -155,11 +161,26 @@ class TestGatherKVWindow(unittest.TestCase):
         plan = _plan()
 
         def fn(k, v):
+            blocks = range(plan.num_q_blocks)
             if k.device.type == "spyre":
-                return torch.ops.spyre.gather_kv_window(
-                    k, v, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
-                )[2]
-            return _reference_band(plan)
+                bands = [_gather_block(k, plan, n, HEADS, 2) for n in blocks]
+            else:
+                bands = [_reference_band(plan, n) for n in blocks]
+            return torch.cat(bands, dim=1)
+
+        compare_with_cpu(fn, self._cache(1), self._cache(2), run_eager=False)
+
+    def test_interior_block_reads_a_shifted_window(self):
+        # Block 2 is the first whose read start is not 0, so it is where a
+        # dropped shift would show up while blocks 0 and 1 still passed.
+        plan = _plan()
+        self.assertEqual(plan.read_start(0), 0)
+        self.assertGreater(plan.read_start(2), 0)
+
+        def fn(k, v):
+            if k.device.type == "spyre":
+                return _gather_block(k, plan, 2, HEADS, 0)
+            return _reference_window(k, plan, 2, HEADS, transpose=True)
 
         compare_with_cpu(fn, self._cache(1), self._cache(2), run_eager=False)
 
@@ -168,76 +189,75 @@ class TestGatherKVWindow(unittest.TestCase):
         # with no intra-block stagger, giving buffer_width == window exactly.
         plan = _plan(seqlen_q=1, seqlen_kv=4096, q_block=1)
         self.assertEqual(plan.buffer_width, WINDOW)
+        self.assertEqual(plan.num_q_blocks, 1)
         cache = cached_randn(
             (BATCH, HEADS, 4096, HEAD_DIM), differentiation=3, dtype=torch.float16
         )
 
         def fn(k, v):
             if k.device.type == "spyre":
-                return torch.ops.spyre.gather_kv_window(
-                    k, v, 1, WINDOW, HEADS, 1, True
-                )[0]
-            return _reference_window(k, plan, HEADS, transpose=True)
+                return _gather_block(k, plan, 0, HEADS, 0)
+            return _reference_window(k, plan, 0, HEADS, transpose=True)
 
         compare_with_cpu(fn, cache, cache, run_eager=False)
 
 
-class TestFoldOrderContract(unittest.TestCase):
-    """The gather's fold order must match the caller's query fold.
+class TestWindowReadValidation(unittest.TestCase):
+    """The op takes its placement as plain ints, so it validates them.
 
-    A mismatch pairs the wrong window with the wrong head and returns wrong
-    numbers without any error, so it is checked directly.
+    A caller that computes read_start itself can walk off the end of the cache;
+    unchecked that surfaces as a shape mismatch deep in the lowering.
     """
 
-    def test_scores_pair_block_n_with_window_n(self):
-        # scores[.., n*Hq + h, ..] must equal q block n of head h against
-        # window n of head h. Built per block on CPU, so a head-major gather
-        # (or a head-major query fold) fails here.
-        plan = _plan()
-        query = cached_randn(
-            (BATCH, HEADS, SEQLEN, HEAD_DIM), differentiation=4, dtype=torch.float16
+    def _args(self, **overrides):
+        args = dict(
+            read_start=0,
+            buffer_width=128,
+            seqlen_kv=256,
+            q_block=64,
+            window_size=64,
+            num_heads=8,
+            num_kv_heads=8,
         )
-        key = cached_randn(
-            (BATCH, HEADS, SEQLEN, HEAD_DIM), differentiation=5, dtype=torch.float16
-        )
-        value = cached_randn(
-            (BATCH, HEADS, SEQLEN, HEAD_DIM), differentiation=6, dtype=torch.float16
-        )
+        args.update(overrides)
+        return args
 
-        def fn(q, k, v):
-            if q.device.type == "spyre":
-                k_win, _, _ = torch.ops.spyre.gather_kv_window(
-                    k, v, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
-                )
-                q4 = _fold_query(q, plan)
-                return torch.matmul(q4, k_win)
+    def test_valid_read_passes(self):
+        self.assertIsNone(check_window_read(**self._args()))
 
-            per_block = []
+    def test_last_legal_read_passes(self):
+        self.assertIsNone(check_window_read(**self._args(read_start=128)))
+
+    def test_read_past_the_cache_is_rejected(self):
+        reason = check_window_read(**self._args(read_start=129))
+        self.assertIsNotNone(reason)
+        self.assertIn("runs past the cache", reason)
+
+    def test_negative_read_is_rejected(self):
+        self.assertIsNotNone(check_window_read(**self._args(read_start=-1)))
+
+    def test_indivisible_gqa_ratio_is_rejected(self):
+        reason = check_window_read(**self._args(num_heads=8, num_kv_heads=3))
+        self.assertIsNotNone(reason)
+        self.assertIn("whole multiple", reason)
+
+    def test_every_plan_read_is_valid(self):
+        # The validator must not reject reads the planner itself produces.
+        for seqlen_q, seqlen_kv, q_block in ((256, 256, 64), (1, 4096, 1)):
+            plan = _plan(seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, q_block=q_block)
             for n in range(plan.num_q_blocks):
-                start = plan.read_start(n)
-                q_blk = q[:, :, n * plan.q_block : (n + 1) * plan.q_block, :]
-                k_blk = k[:, :, start : start + plan.buffer_width, :]
-                per_block.append(torch.matmul(q_blk, k_blk.transpose(-1, -2)))
-            return torch.cat(per_block, dim=1)
-
-        compare_with_cpu(fn, query, key, value, run_eager=False)
-
-    def test_band_splits_as_a_free_view(self):
-        # Block-major is what makes scores.view(B, N, Hq, qb, Wb) valid, which
-        # is how the band broadcasts across heads instead of being replicated.
-        plan = _plan()
-        scores = cached_randn(
-            (BATCH, plan.num_q_blocks * HEADS, plan.q_block, plan.buffer_width),
-            differentiation=7,
-            dtype=torch.float16,
-        )
-        band = _reference_band(plan)
-
-        def fn(s, b):
-            split = s.view(BATCH, plan.num_q_blocks, HEADS, plan.q_block, -1)
-            return (split + b).view(BATCH, -1, plan.q_block, plan.buffer_width)
-
-        compare_with_cpu(fn, scores, band, run_eager=False)
+                self.assertIsNone(
+                    check_window_read(
+                        read_start=plan.read_start(n),
+                        buffer_width=plan.buffer_width,
+                        seqlen_kv=seqlen_kv,
+                        q_block=plan.q_block,
+                        window_size=plan.window_size,
+                        num_heads=HEADS,
+                        num_kv_heads=HEADS,
+                    ),
+                    f"planner produced a read the op rejects (block {n})",
+                )
 
 
 if __name__ == "__main__":

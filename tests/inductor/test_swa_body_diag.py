@@ -12,34 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bisect the increment-5 body failure. Expect some of these to FAIL.
+"""Bisect the rolled-window body, one construct at a time.
 
-Every gathered-window kernel test died with the same error, independent of
-shape:
+_window_roll_attention adds several constructs at once, so this file builds
+one iteration of it up in stages on a single shape. The first stage that fails
+names the culprit, which is otherwise a compile error with no line number.
+
+  A  gather + matmul                                (rank 4, one block)
+  B  A + the rank-4 band
+  C  B + softmax + second matmul
+  D  C + online-softmax accumulators
+  E  D + the four spyre_hints                       (== one loop iteration)
+  F  E over every block, concatenated               (== the whole body)
+
+Stages A-E run block 2 -- the first block whose read start is not 0, so a
+dropped window shift shows up here rather than passing by accident.
+
+This file replaces the earlier bisect of the abandoned all-at-once body. That
+one was chasing
 
     RuntimeError: Incompatible host_size and dim_order
-    (spyre_tensor_impl.cpp:147 -- a tensor's host_size and dim_order
-     disagree in length, i.e. a rank mismatch)
+    (spyre_tensor_impl.cpp:147 -- a tensor's host_size and dim_order disagree
+     in length, i.e. a rank mismatch)
 
-_window_gather_attention adds several constructs at once, so this file builds
-the body up one construct at a time on a single shape. The first test that
-fails names the culprit.
-
-  A  gather + query fold + matmul                      (rank 4 only)
-  B  A + band added through a rank-5 view              <- prime suspect
-  C  A + band pre-folded to rank 4                     <- the alternative
-  D  C or B + softmax + second matmul
-  E  D + online-softmax accumulators
-  F  E + the four spyre_hints                          (== the real body)
-
-Reading it:
-
-  A fails                -> the gather/fold/matmul core is wrong
-  B fails, C passes      -> the rank-5 view is the problem; emit a rank-4
-                            band from the op (costs Hq x band memory)
-  B and C pass, D fails  -> softmax shapes, not the band
-  E fails, D passes      -> the accumulators
-  F fails, E passes      -> a hint names a dim that does not resolve
+whose prime suspect was that body's rank-5 band view,
+scores.view(B, N, Hq, qb, Wb) + band. Rolling has no fold and therefore no
+rank-5 anything, so if the stages below pass, that failure was the fold's and
+died with it. If A or B still fails, the problem is in the shared flash body
+and would have bitten either design.
 
 Run:
     SENCORES=1 python3 -m pytest tests/inductor/test_swa_body_diag.py -v
@@ -63,10 +63,12 @@ Q_BLOCK = 64
 
 PLAN = plan_window_gather(SEQLEN, SEQLEN, WINDOW, q_block=Q_BLOCK)
 assert PLAN is not None
-NBLOCKS = PLAN.num_q_blocks
 BUFFER_WIDTH = PLAN.buffer_width
-FOLDED = NBLOCKS * HEADS
 SCALE = 1.0 / math.sqrt(math.sqrt(HEAD_DIM))
+
+# The first block that reads from a nonzero offset.
+BLOCK = 2
+assert PLAN.read_start(BLOCK) > 0
 
 
 def _inputs():
@@ -82,151 +84,131 @@ def _inputs():
     return query, key, value
 
 
-def _band_blocks() -> torch.Tensor:
-    """[N, q_block, buffer_width] additive band, one per Q block."""
+def _band(block_index: int = BLOCK) -> torch.Tensor:
+    """[1, 1, q_block, Wb] additive band for one block."""
     columns = torch.arange(BUFFER_WIDTH)
-    blocks = []
-    for block_index in range(NBLOCKS):
-        start = PLAN.read_start(block_index)
-        q_start, _ = PLAN.block_q_range(block_index)
-        rows = []
-        for offset in range(PLAN.q_block):
-            low, high = PLAN.row_window(q_start + offset)
-            rows.append((columns + start >= low) & (columns + start < high))
-        blocks.append(torch.stack(rows))
-    allowed = torch.stack(blocks)
+    start = PLAN.read_start(block_index)
+    q_start, _ = PLAN.block_q_range(block_index)
+    rows = []
+    for offset in range(PLAN.q_block):
+        low, high = PLAN.row_window(q_start + offset)
+        rows.append((columns + start >= low) & (columns + start < high))
+    allowed = torch.stack(rows)
     band = torch.zeros(allowed.shape, dtype=torch.float16)
     band.masked_fill_(~allowed, float("-inf"))
-    return band
+    return band.unsqueeze(0).unsqueeze(0)
 
 
-def _band_rank5() -> torch.Tensor:
-    """[1, N, 1, q_block, Wb] -- broadcasts across heads, minimal memory."""
-    return _band_blocks().unsqueeze(0).unsqueeze(2)
-
-
-def _band_rank4() -> torch.Tensor:
-    """[1, N*Hq, q_block, Wb] -- materialized per head, block-major."""
-    return _band_blocks().repeat_interleave(HEADS, dim=0).unsqueeze(0)
-
-
-def _fold_query(query: torch.Tensor) -> torch.Tensor:
-    return torch.cat(
-        [query[:, :, n * Q_BLOCK : (n + 1) * Q_BLOCK, :] for n in range(NBLOCKS)],
-        dim=1,
-    )
-
-
-def _gather(key: torch.Tensor, value: torch.Tensor):
-    """Op on spyre, equivalent slices on CPU."""
+def _gather(key: torch.Tensor, value: torch.Tensor, block_index: int = BLOCK):
+    """Op on spyre, the equivalent slices on CPU."""
+    start = PLAN.read_start(block_index)
+    q_start, _ = PLAN.block_q_range(block_index)
     if key.device.type == "spyre":
         return torch.ops.spyre.gather_kv_window(
-            key, value, SEQLEN, WINDOW, HEADS, Q_BLOCK, True
+            key,
+            value,
+            start,
+            BUFFER_WIDTH,
+            HEADS,
+            Q_BLOCK,
+            PLAN.q_kv_offset + q_start,
+            WINDOW,
+            True,
         )[:2]
-    starts = [PLAN.read_start(n) for n in range(NBLOCKS)]
-    k_win = torch.cat(
-        [key[:, :, s : s + BUFFER_WIDTH, :].transpose(-1, -2) for s in starts], dim=1
-    )
-    v_win = torch.cat([value[:, :, s : s + BUFFER_WIDTH, :] for s in starts], dim=1)
+    k_win = key[:, :, start : start + BUFFER_WIDTH, :].transpose(-1, -2)
+    v_win = value[:, :, start : start + BUFFER_WIDTH, :]
     return k_win, v_win
 
 
-def _scores(query, key, value):
-    k_win, _ = _gather(key, value)
-    return torch.matmul(_fold_query(query) * SCALE, k_win * SCALE)
+def _q_rows(query: torch.Tensor, block_index: int = BLOCK) -> torch.Tensor:
+    q_start, q_end = PLAN.block_q_range(block_index)
+    return query[:, :, q_start:q_end, :]
+
+
+def _scores(query, key, value, block_index: int = BLOCK):
+    k_win, _ = _gather(key, value, block_index)
+    return torch.matmul(_q_rows(query, block_index) * SCALE, k_win * SCALE)
+
+
+def _accumulated_block(q, k, v, band, block_index: int = BLOCK):
+    """One block through the full accumulator body, without the hints."""
+    k_win, v_win = _gather(k, v, block_index)
+    running_max = torch.full(
+        (BATCH, HEADS, Q_BLOCK, 64), float("-inf"), device=q.device, dtype=q.dtype
+    ).amax(dim=-1)
+    denominator = torch.zeros(
+        (BATCH, HEADS, Q_BLOCK, 64), device=q.device, dtype=q.dtype
+    ).amax(dim=-1)
+    output = torch.zeros(
+        (BATCH, HEADS, Q_BLOCK, HEAD_DIM), device=q.device, dtype=q.dtype
+    )
+
+    scores = torch.matmul(_q_rows(q, block_index) * SCALE, k_win * SCALE) + band
+    block_max = torch.amax(scores, dim=-1)
+    max_running = torch.maximum(running_max, block_max)
+    exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
+    correction = torch.exp(running_max - max_running)
+    denominator = torch.ops.spyre.copy_f(
+        denominator * correction + exp_scores.sum(dim=-1), denominator
+    )
+    output = torch.ops.spyre.copy_f(
+        output * correction.unsqueeze(-1) + torch.matmul(exp_scores, v_win),
+        output,
+    )
+    return torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
 
 
 class TestBodyBisect(unittest.TestCase):
-    def test_a_gather_fold_matmul(self):
+    def test_a_gather_and_matmul(self):
         def fn(q, k, v):
             return _scores(q, k, v)
 
         compare_with_cpu(fn, *_inputs(), run_eager=False)
 
-    def test_b_band_through_rank5_view(self):
-        def fn(q, k, v, band):
-            scores = _scores(q, k, v)
-            return (
-                scores.view(BATCH, NBLOCKS, HEADS, Q_BLOCK, BUFFER_WIDTH) + band
-            ).view(BATCH, FOLDED, Q_BLOCK, BUFFER_WIDTH)
-
-        compare_with_cpu(fn, *_inputs(), _band_rank5(), run_eager=False)
-
-    def test_c_band_prefolded_rank4(self):
+    def test_b_band(self):
         def fn(q, k, v, band):
             return _scores(q, k, v) + band
 
-        compare_with_cpu(fn, *_inputs(), _band_rank4(), run_eager=False)
+        compare_with_cpu(fn, *_inputs(), _band(), run_eager=False)
 
-    def test_d_softmax_and_second_matmul(self):
-        # Uses the rank-4 band so this stage is independent of B's outcome.
+    def test_c_softmax_and_second_matmul(self):
         def fn(q, k, v, band):
             k_win, v_win = _gather(k, v)
-            scores = torch.matmul(_fold_query(q) * SCALE, k_win * SCALE) + band
+            scores = torch.matmul(_q_rows(q) * SCALE, k_win * SCALE) + band
             block_max = torch.amax(scores, dim=-1)
             exp_scores = torch.exp(scores - block_max.unsqueeze(-1))
             denominator = exp_scores.sum(dim=-1)
-            out = torch.matmul(exp_scores, v_win)
-            return out / denominator.unsqueeze(-1)
+            return torch.matmul(exp_scores, v_win) / denominator.unsqueeze(-1)
 
-        compare_with_cpu(fn, *_inputs(), _band_rank4(), run_eager=False)
+        compare_with_cpu(fn, *_inputs(), _band(), run_eager=False)
 
-    def test_e_online_softmax_accumulators(self):
+    def test_d_online_softmax_accumulators(self):
         def fn(q, k, v, band):
-            k_win, v_win = _gather(k, v)
-            m_reduced = torch.full(
-                (BATCH, FOLDED, Q_BLOCK, 64),
-                float("-inf"),
-                device=q.device,
-                dtype=q.dtype,
-            )
-            running_max = m_reduced.amax(dim=-1)
-            denominator = torch.zeros(
-                (BATCH, FOLDED, Q_BLOCK, 64), device=q.device, dtype=q.dtype
-            ).amax(dim=-1)
-            output = torch.zeros(
-                (BATCH, FOLDED, Q_BLOCK, HEAD_DIM), device=q.device, dtype=q.dtype
-            )
+            return _accumulated_block(q, k, v, band)
 
-            scores = torch.matmul(_fold_query(q) * SCALE, k_win * SCALE) + band
-            block_max = torch.amax(scores, dim=-1)
-            max_running = torch.maximum(running_max, block_max)
-            exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
-            correction = torch.exp(running_max - max_running)
-            denominator = torch.ops.spyre.copy_f(
-                denominator * correction + exp_scores.sum(dim=-1), denominator
-            )
-            output = torch.ops.spyre.copy_f(
-                output * correction.unsqueeze(-1) + torch.matmul(exp_scores, v_win),
-                output,
-            )
-            return torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
+        compare_with_cpu(fn, *_inputs(), _band(), run_eager=False)
 
-        compare_with_cpu(fn, *_inputs(), _band_rank4(), run_eager=False)
-
-    def test_f_with_hints(self):
+    def test_e_with_hints(self):
         def fn(q, k, v, band):
-            k_win, v_win = _gather(k, v)
-            output = torch.zeros(
-                (BATCH, FOLDED, Q_BLOCK, HEAD_DIM), device=q.device, dtype=q.dtype
-            )
             with spyre_hint(tiles={"batch_size": max(1, BATCH // 2)}):
-                with spyre_hint(tiles={"num_heads": max(1, FOLDED // 4)}):
+                with spyre_hint(tiles={"num_heads": max(1, HEADS // 4)}):
                     with spyre_hint(tiles={"window_size": max(1, BUFFER_WIDTH // 64)}):
                         with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
-                            scores = (
-                                torch.matmul(_fold_query(q) * SCALE, k_win * SCALE)
-                                + band
-                            )
-                            block_max = torch.amax(scores, dim=-1)
-                            exp_scores = torch.exp(scores - block_max.unsqueeze(-1))
-                            denominator = exp_scores.sum(dim=-1)
-                            output = torch.ops.spyre.copy_f(
-                                torch.matmul(exp_scores, v_win), output
-                            )
-            return output / denominator.unsqueeze(-1)
+                            return _accumulated_block(q, k, v, band)
 
-        compare_with_cpu(fn, *_inputs(), _band_rank4(), run_eager=False)
+        compare_with_cpu(fn, *_inputs(), _band(), run_eager=False)
+
+    def test_f_every_block_concatenated(self):
+        # The loop itself: N independent iterations, cat along the sequence.
+        # Fails here with D passing => the repetition, not the body.
+        def fn(q, k, v):
+            blocks = [
+                _accumulated_block(q, k, v, _band(n).to(q.device), n)
+                for n in range(PLAN.num_q_blocks)
+            ]
+            return torch.cat(blocks, dim=2)
+
+        compare_with_cpu(fn, *_inputs(), run_eager=False)
 
 
 if __name__ == "__main__":

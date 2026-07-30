@@ -28,7 +28,11 @@ The one invariant everything downstream rests on:
     for every query row, that row's window (intersected with the cache) lies
     entirely inside the buffer its Q block reads.
 
-See format/swa_window_gather_plan.md for the design and the increment ladder.
+The arithmetic here is independent of how the windows are *consumed*: it held
+for the abandoned all-at-once gather and holds unchanged now that one buffer is
+rolled across blocks.
+
+See format/swa_window_roll_plan.md for the design and the increment ladder.
 """
 
 from dataclasses import dataclass
@@ -93,6 +97,47 @@ class WindowGatherPlan:
         first_coord = self.q_kv_offset + q_start
         window_origin = max(0, _floor_stick(first_coord - self.window_size + 1))
         return min(window_origin, self.seqlen_kv - self.buffer_width)
+
+
+def check_window_read(
+    read_start: int,
+    buffer_width: int,
+    seqlen_kv: int,
+    q_block: int,
+    window_size: int,
+    num_heads: int,
+    num_kv_heads: int,
+) -> str | None:
+    """Validate one window read, returning the reason it is invalid or None.
+
+    The gather op takes its placement as plain integers, so a caller that
+    computes them itself — rather than through ``plan_window_gather`` — can
+    hand over a read that runs off the end of the cache or a GQA ratio that
+    does not divide. Both would otherwise surface as a shape mismatch deep in
+    the lowering, so they are caught at the op boundary instead.
+
+    Returns a string rather than raising so this module stays free of both
+    torch and the backend's error classes; the caller raises ``Unsupported``.
+    """
+    if read_start < 0:
+        return f"read_start={read_start} is negative"
+    if buffer_width <= 0:
+        return f"buffer_width={buffer_width} must be positive"
+    if read_start + buffer_width > seqlen_kv:
+        return (
+            f"window [{read_start}, {read_start + buffer_width}) runs past the "
+            f"cache (seqlen_kv={seqlen_kv})"
+        )
+    if q_block <= 0:
+        return f"q_block={q_block} must be positive"
+    if window_size <= 0:
+        return f"window_size={window_size} must be positive"
+    if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+        return (
+            f"num_heads={num_heads} is not a whole multiple of "
+            f"num_kv_heads={num_kv_heads}"
+        )
+    return None
 
 
 def _required_width(

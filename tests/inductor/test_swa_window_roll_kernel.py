@@ -12,22 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end correctness of the gathered-window SWA path (increment 5).
+"""End-to-end correctness of the rolled-window SWA path (increment R4).
 
-Runs spyre::sliding_window_attention with config.swa_window_gather ON, so the
-op takes _window_gather_attention -- one compact [B, N*Hq, Wb, E] KV buffer,
-no Python loop over Q blocks, and the flash body tiled over window_size
-instead of max_seqlen_kv. Compared against SDPA with a full band mask, which
-is the definition of sliding-window attention.
+Runs spyre::sliding_window_attention with config.swa_window_roll ON, so the op
+takes _window_roll_attention -- one [B, Hq, Wb, E] KV window buffer per Q
+block, a Python loop over the blocks, and the flash body tiled over
+window_size instead of max_seqlen_kv. Compared against SDPA with a full band
+mask, which is the definition of sliding-window attention.
 
-Note what this file does NOT establish: whether the four spyre_hints actually
-produce device loops. Untiled code returns the right answer with one large
-intermediate, so every test here would still pass if the hints silently
-no-op'd -- which has happened before on this op. That is increment 6, and it
-has to be checked structurally.
+Note the two things this file does NOT establish:
+
+  - whether the four spyre_hints actually produce device loops. Untiled code
+    returns the right answer with one large intermediate, so every test here
+    would still pass if the hints silently no-op'd -- which has happened
+    before on this op. That is increment R6, and it has to be checked
+    structurally.
+  - whether the window buffer is actually reused across blocks. The blocks are
+    independent, so nothing here forces peak memory to be one buffer rather
+    than N; getting that is the entire reason rolling was chosen over
+    gathering all windows at once. That is increment R5.
 
 Run:
-    SENCORES=1 python3 -m pytest tests/inductor/test_swa_window_gather_kernel.py -v
+    SENCORES=1 python3 -m pytest tests/inductor/test_swa_window_roll_kernel.py -v
 """
 
 import unittest
@@ -78,23 +84,23 @@ def _inputs(batch, heads, kvheads, seqlen_q, seqlen_kv):
     return query, key, value
 
 
-class _GatherPathEnabled(unittest.TestCase):
-    """Turns the gathered-window path on for the duration of each test."""
+class _RollPathEnabled(unittest.TestCase):
+    """Turns the rolled-window path on for the duration of each test."""
 
-    gather_enabled = True
+    roll_enabled = True
 
     def setUp(self):
-        self._saved = spyre_config.swa_window_gather
-        spyre_config.swa_window_gather = self.gather_enabled
+        self._saved = spyre_config.swa_window_roll
+        spyre_config.swa_window_roll = self.roll_enabled
         torch._dynamo.reset()
 
     def tearDown(self):
-        spyre_config.swa_window_gather = self._saved
+        spyre_config.swa_window_roll = self._saved
         torch._dynamo.reset()
 
 
-class TestWindowGatherKernel(_GatherPathEnabled):
-    """Shapes the gather path accepts, against the masked reference."""
+class TestWindowRollKernel(_RollPathEnabled):
+    """Shapes the roll path accepts, against the masked reference."""
 
     def test_prefill_mha(self):
         # Lq=Lkv=256, W=64 -> q_block=64, 4 blocks, buffer_width=128.
@@ -131,8 +137,8 @@ class TestWindowGatherKernel(_GatherPathEnabled):
         compare_with_cpu(_attention, query, key, value, 64, run_eager=False)
 
 
-class TestFallbacksStillCorrect(_GatherPathEnabled):
-    """Shapes the gather rejects must silently keep the unrolled path."""
+class TestFallbacksStillCorrect(_RollPathEnabled):
+    """Shapes the planner rejects must silently keep the unrolled path."""
 
     def test_window_not_stick_multiple(self):
         # plan_window_gather returns None for window % 64 != 0.
@@ -146,10 +152,10 @@ class TestFallbacksStillCorrect(_GatherPathEnabled):
         compare_with_cpu(_attention, query, key, value, 64, run_eager=False)
 
 
-class TestDefaultPathUnchanged(_GatherPathEnabled):
+class TestDefaultPathUnchanged(_RollPathEnabled):
     """With the flag OFF nothing may change -- this is the regression guard."""
 
-    gather_enabled = False
+    roll_enabled = False
 
     def test_prefill_mha(self):
         query, key, value = _inputs(1, 8, 8, 256, 256)

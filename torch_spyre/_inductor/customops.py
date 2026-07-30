@@ -863,71 +863,65 @@ def _(
     "spyre::window_band_mask", mutates_args=(), device_types="spyre"
 )
 def window_band_mask(
-    read_starts: list[int],
+    read_start: int,
     q_block: int,
     buffer_width: int,
-    seqlen_q: int,
-    seqlen_kv: int,
+    q_row_origin: int,
     window_size: int,
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
     """
-    Additive band over every Q block's gathered KV window.
+    Additive band over one Q block's rolled KV window.
 
-    Shape: [1, N, 1, q_block, buffer_width]; 0.0 = keep, -inf = masked. The
-    size-1 head axis is what keeps this at Lq x buffer_width elements instead
-    of one copy per head — it broadcasts across heads in the block-major
-    layout (see format/swa_window_gather_plan.md section 4).
+    Shape: [1, 1, q_block, buffer_width]; 0.0 = keep, -inf = masked. Both
+    leading axes are size 1 and broadcast over batch and heads, which keeps
+    this at q_block x buffer_width elements rather than one copy per head.
 
-    Query row ``q_block*n + i`` (absolute KV coordinate
-    ``seqlen_kv - seqlen_q + q_block*n + i``) may attend column
-    ``read_starts[n] + j`` iff, with ``delta`` the difference of those two
-    absolute coordinates:
+    Query row ``q_row_origin + i`` (an absolute KV-cache coordinate: row 0 of
+    this block sits at ``seqlen_kv - seqlen_q + q_block*n``) may attend column
+    ``read_start + j`` iff, with ``delta`` the difference of those two absolute
+    coordinates:
       - causal:        0 <= delta < window_size
       - bidirectional: abs(delta) < window_size
 
     The band removes what the buffer over-covers: the stagger between rows
-    inside one block, and the columns pulled in when a ragged first/last
+    inside the block, and the columns pulled in when a ragged first/last
     window is shifted to stay inside the cache.
+
+    Takes ``read_start`` and ``q_row_origin`` rather than a block index and the
+    sequence lengths, so the op knows nothing about how the caller blocks the
+    query — see format/swa_window_roll_plan.md section 4.
 
     Built entirely on CPU so the in-place ops stay opaque to torch.compile,
     matching spyre.causal_mask's and spyre.sliding_window_block_mask's
     rationale.
     """
-    q_kv_offset = seqlen_kv - seqlen_q
-    blocks = []
-    column = torch.arange(buffer_width, device="cpu")
-    for block_index, read_start in enumerate(read_starts):
-        row = torch.arange(q_block, device="cpu") + q_kv_offset + q_block * block_index
-        delta = row.unsqueeze(-1) - (column.unsqueeze(0) + read_start)
-        if is_causal:
-            allowed = (delta >= 0) & (delta < window_size)
-        else:
-            allowed = delta.abs() < window_size
-        blocks.append(allowed)
-    stacked = torch.stack(blocks)  # N, q_block, buffer_width
-    mask_cpu = torch.zeros(stacked.shape, dtype=dtype, device="cpu")
-    mask_cpu.masked_fill_(~stacked, float("-inf"))
-    return mask_cpu.unsqueeze(0).unsqueeze(2).to(device=device)
+    row = torch.arange(q_block, device="cpu") + q_row_origin
+    column = torch.arange(buffer_width, device="cpu") + read_start
+    delta = row.unsqueeze(-1) - column.unsqueeze(0)
+    if is_causal:
+        allowed = (delta >= 0) & (delta < window_size)
+    else:
+        allowed = delta.abs() < window_size
+    mask_cpu = torch.zeros(allowed.shape, dtype=dtype, device="cpu")
+    mask_cpu.masked_fill_(~allowed, float("-inf"))
+    return mask_cpu.unsqueeze(0).unsqueeze(0).to(device=device)
 
 
 @window_band_mask.register_fake
 def _(
-    read_starts: list[int],
+    read_start: int,
     q_block: int,
     buffer_width: int,
-    seqlen_q: int,
-    seqlen_kv: int,
+    q_row_origin: int,
     window_size: int,
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    return torch.empty(
-        1, len(read_starts), 1, q_block, buffer_width, dtype=dtype, device=device
-    )
+    return torch.empty(1, 1, q_block, buffer_width, dtype=dtype, device=device)
 
 
 @torch.library.custom_op(
@@ -936,32 +930,40 @@ def _(
 def gather_kv_window(  # type: ignore[empty-body]
     key: torch.Tensor,
     value: torch.Tensor,
-    seqlen_q: int,
-    window_size: int,
+    read_start: int,
+    buffer_width: int,
     num_heads: int,
     q_block: int,
+    q_row_origin: int,
+    window_size: int,
     is_causal: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Gather each Q block's sliding window out of the KV cache.
+    Copy one Q block's sliding window out of the KV cache.
 
     key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win, band) where
-    k_win is [B, N*Hq, E, buffer_width] — already **transposed**, so the
-    caller matmuls it directly — v_win is [B, N*Hq, buffer_width, E], and
-    band is [1, N, 1, q_block, buffer_width].
+    k_win is [B, Hq, E, buffer_width] — already **transposed**, so the caller
+    matmuls it directly — v_win is [B, Hq, buffer_width, E], and band is
+    [1, 1, q_block, buffer_width].
 
-    K comes out transposed because transposing the gathered buffer *afterwards*
-    crashes insert_restickify (StopIteration: the cat buffer's FX node is not
-    in env). Transposing each slice before the cat avoids it entirely.
+    **One block per call.** The caller loops over Q blocks and reuses the same
+    window buffer, rather than materializing all N windows at once: the buffer
+    is W + q_block rows for any query length instead of N x (W + q_block),
+    which is the memory the feature exists to save. See
+    format/swa_window_roll_plan.md sections 0 and 2 — in particular section 2,
+    on the reuse being granted by the memory planner rather than expressed by
+    the graph.
 
-    N = number of Q blocks. The folded axis is **block-major**, index
-    ``n*Hq + h``, so that splitting it back into (N, Hq) is a free view and the
-    band can stay one-per-block rather than one-per-(block, head). The caller's
-    query fold MUST use the same order — see the fold-order contract in
-    format/swa_window_gather_plan.md section 4.
+    ``read_start`` (where in the cache this window begins) and ``q_row_origin``
+    (the absolute KV coordinate of the block's first query row) come from
+    WindowGatherPlan. Passing them in, rather than a block index, keeps this op
+    ignorant of how the query is blocked.
 
-    GQA expansion to num_heads happens here, applied to each window slice
-    rather than to the full-length cache (see the decomposition for why).
+    K comes out transposed because that is the layout the scores matmul wants;
+    doing it on the slice costs nothing and saves a transpose on the consumer.
+
+    GQA expansion to num_heads happens here, applied to the window slice rather
+    than to the full-length cache (see the decomposition for why).
 
     MUST be called under torch.compile(backend="inductor") on the spyre
     device — this eager body is intentionally empty, matching
@@ -975,28 +977,32 @@ def gather_kv_window(  # type: ignore[empty-body]
 def _(
     key: torch.Tensor,
     value: torch.Tensor,
-    seqlen_q: int,
-    window_size: int,
+    read_start: int,
+    buffer_width: int,
     num_heads: int,
     q_block: int,
+    q_row_origin: int,
+    window_size: int,
     is_causal: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from .swa_window_gather import plan_window_gather
+    from .swa_window_gather import check_window_read
 
-    plan = plan_window_gather(
-        seqlen_q, key.size(2), window_size, is_causal=is_causal, q_block=q_block
+    reason = check_window_read(
+        read_start=read_start,
+        buffer_width=buffer_width,
+        seqlen_kv=key.size(2),
+        q_block=q_block,
+        window_size=window_size,
+        num_heads=num_heads,
+        num_kv_heads=key.size(1),
     )
-    if plan is None:
-        raise Unsupported(
-            f"gather_kv_window: unsupported shape (seqlen_q={seqlen_q}, "
-            f"seqlen_kv={key.size(2)}, window_size={window_size}, "
-            f"is_causal={is_causal}) — caller must check plan_window_gather first"
-        )
-    folded = plan.num_q_blocks * num_heads
+    if reason is not None:
+        raise Unsupported(f"gather_kv_window: {reason}")
+
     batch, _, _, head_dim = key.shape
-    k_win = key.new_empty((batch, folded, head_dim, plan.buffer_width))
-    v_win = key.new_empty((batch, folded, plan.buffer_width, head_dim))
-    band = key.new_empty((1, plan.num_q_blocks, 1, q_block, plan.buffer_width))
+    k_win = key.new_empty((batch, num_heads, head_dim, buffer_width))
+    v_win = key.new_empty((batch, num_heads, buffer_width, head_dim))
+    band = key.new_empty((1, 1, q_block, buffer_width))
     return k_win, v_win, band
 
 
