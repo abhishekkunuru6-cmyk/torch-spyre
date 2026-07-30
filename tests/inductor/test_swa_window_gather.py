@@ -256,3 +256,28 @@ class TestPlanIsImmutable:
         assert isinstance(plan, WindowGatherPlan)
         with pytest.raises(Exception):
             plan.buffer_width = 999  # type: ignore[misc]
+
+
+class TestFullyAttendedBlocks:
+    """Which blocks have a band that masks nothing."""
+
+    def test_decode_masks_nothing(self):
+        # buffer_width == window and the read start lands on the row's own
+        # window, so the single row attends every column.
+        plan = plan_window_gather(1, 4096, 64, q_block=1)
+        assert plan is not None
+        assert plan.block_is_fully_attended(0)
+
+    def test_decode_gqa_shape_masks_nothing(self):
+        plan = plan_window_gather(1, 512, 128, q_block=1)
+        assert plan is not None
+        assert plan.block_is_fully_attended(0)
+
+    def test_prefill_blocks_all_mask_something(self):
+        # Rows inside a 64-row block have staggered windows, so no block of a
+        # real prefill is fully attended -- the band is doing work there.
+        plan = plan_window_gather(256, 256, 64)
+        assert plan is not None
+        assert not any(
+            plan.block_is_fully_attended(n) for n in range(plan.num_q_blocks)
+        )

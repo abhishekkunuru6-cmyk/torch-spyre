@@ -84,6 +84,26 @@ class WindowGatherPlan:
         hi = min(self.seqlen_kv, coord + 1)
         return lo, hi
 
+    def block_is_fully_attended(self, qi: int) -> bool:
+        """True when block ``qi``'s band masks nothing.
+
+        Every row of the block can attend every column of its buffer, so the
+        additive band is all zeros and adding it is a no-op. Decode is always
+        this case: one row, ``buffer_width == window_size``, and a read start
+        that lands exactly on the row's own window.
+
+        Worth knowing rather than adding zeros, and worth knowing *in Python*:
+        the band is a tensor by the time the body sees it, so a caller cannot
+        ask this of the tensor without materializing and reducing it.
+        """
+        start = self.read_start(qi)
+        stop = start + self.buffer_width
+        q_start, q_end = self.block_q_range(qi)
+        return all(
+            self.row_window(q_index)[0] <= start and self.row_window(q_index)[1] >= stop
+            for q_index in range(q_start, q_end)
+        )
+
     def read_start(self, qi: int) -> int:
         """Cache offset Q block ``qi``'s buffer is gathered from.
 

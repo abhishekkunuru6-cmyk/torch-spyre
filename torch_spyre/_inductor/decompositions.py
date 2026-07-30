@@ -843,7 +843,20 @@ def _window_roll_attention(
                         # The band is [1, 1, q_block, buffer_width] and
                         # broadcasts over batch and heads -- no view, no
                         # replication per head.
-                        scores = scores + band
+                        #
+                        # Skipped entirely when it masks nothing. Decode is
+                        # always that case: one row, buffer_width ==
+                        # window_size, and a read start on the row's own
+                        # window, so every column is attended and the band is
+                        # all zeros. Adding zeros is work, and it is work whose
+                        # only failure mode is silent: every piece of the
+                        # decode shape passes in isolation -- k_win, v_win, the
+                        # band itself -- while the composition is wrong, and
+                        # this add is the one place the band participates as a
+                        # fused intermediate rather than as a graph input or
+                        # output.
+                        if not plan.block_is_fully_attended(block_index):
+                            scores = scores + band
 
                         block_max = torch.amax(scores, dim=-1)
                         max_running = torch.maximum(running_max, block_max)
