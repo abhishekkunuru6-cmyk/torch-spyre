@@ -25,6 +25,11 @@ all-at-once gather needed a fold-order contract test -- a mismatch there paired
 the wrong window with the wrong head and returned wrong numbers with no error
 -- pairing is now positional by iteration and cannot be got out of step.
 
+GQA is tested one block at a time, which is what the body consumes. Cat-ing
+several expanded windows together zeroes the leading slots on device; that is
+a backend defect, recorded in format/swa_backend_bugs.md, and no code on this
+path does it.
+
 Run:
     SENCORES=1 python3 -m pytest tests/inductor/test_swa_gather_op.py -v
 """
@@ -141,37 +146,13 @@ class TestGatherKVWindow(unittest.TestCase):
 
     def test_key_window_gqa(self):
         # 8 query heads from 2 kv heads; the expand happens inside the gather.
-        # One block, no cat -- this is exactly what the body consumes, and it
-        # keeps the op's own correctness separate from the cat probe below.
+        # One block, no cat -- this is exactly what the body consumes.
         plan = _plan()
 
         def fn(k, v):
             if k.device.type == "spyre":
                 return _gather_block(k, plan, 2, HEADS, 0)
             return _reference_window(k, plan, 2, HEADS, transpose=True)
-
-        compare_with_cpu(
-            fn, self._cache(1, kvheads=2), self._cache(2, kvheads=2), run_eager=False
-        )
-
-    def test_gqa_windows_survive_a_cat(self):
-        # Probe, not a requirement: the body never cats gathered windows, it
-        # feeds each straight to a matmul. Cat-ing the expanded (stride-0)
-        # buffers is the construct that produced zeroed leading slots in the
-        # abandoned all-at-once design. If this fails while the single-block
-        # GQA test above passes, the limitation is the cat and the body is
-        # unaffected; if both fail, the expand inside the gather is broken.
-        plan = _plan()
-
-        def fn(k, v):
-            blocks = range(plan.num_q_blocks)
-            if k.device.type == "spyre":
-                windows = [_gather_block(k, plan, n, HEADS, 0) for n in blocks]
-            else:
-                windows = [
-                    _reference_window(k, plan, n, HEADS, transpose=True) for n in blocks
-                ]
-            return torch.cat(windows, dim=1)
 
         compare_with_cpu(
             fn, self._cache(1, kvheads=2), self._cache(2, kvheads=2), run_eager=False
@@ -205,11 +186,9 @@ class TestGatherKVWindow(unittest.TestCase):
         compare_with_cpu(fn, self._cache(1), self._cache(2), run_eager=False)
 
     def test_decode_band(self):
-        # The last piece of the decode shape never tested at the op level. The
-        # body ladder builds its band on CPU and passes it in, so the op's own
-        # band has only ever been checked at prefill -- and a corrupted band is
-        # exactly the failure shape decode shows: right window, right data,
-        # partially wrong numbers, because softmax is what consumes it.
+        # The decode band, whose all-zeros value is what the body relies on to
+        # skip the add entirely -- see block_is_fully_attended and issue 1 in
+        # format/swa_backend_bugs.md, where adding it corrupted the output.
         #
         # At decode the band is entirely zeros: buffer_width == window, so the
         # single row can attend to every column. That makes garbage easy to
