@@ -1,5 +1,13 @@
 # SWA via a compact gathered KV window — plan
 
+> **SUPERSEDED (2026-07-30) by `format/swa_window_roll_plan.md`.** Antoni ruled
+> on the open prefill question: roll one `[B, H, W+T, E]` buffer and pay the
+> sequential kernel launches, rather than materialize all `N` windows at once
+> and pay `N × (W+T)` memory — "the whole point of this is to save the memory."
+> Section 3's placement arithmetic and the increment 1-3 results still hold and
+> carry over verbatim; sections 4-5 (the block-major fold) do not. Kept for the
+> record of why all-at-once was dropped and what it cost to find out.
+
 **Branch:** `swa-window-gather` = `origin/main` (8adbf38) + three cherry-picks
 that bring the SWA op and its tests, and *nothing else*:
 
