@@ -311,6 +311,47 @@ discrimination was 8x, far past that noise.
 "one kernel launch per tile" over-counts. §3's worry about `N` launches at
 large `Lq` should be re-measured before it drives a `T` sweep.
 
+### R5b: rolled against the unrolled fallback
+
+The comparison the design decision actually rests on. Measuring only the path
+being advocated for proves it works, not that it is better.
+
+| `W` | fallback shapes | rolled pool | fallback pool | ratio |
+|---:|---:|---:|---:|---:|
+| 64 | 2 | 1.000 MiB | 1.0625 MiB | 0.94 |
+| 128 | 3 | 1.250 | 1.1875 | 1.05 |
+| 192 | 4 | 1.375 | 1.3125 | 1.05 |
+| 256 | 5 | 1.375 | 1.9375 | 0.71 |
+| 320 | 6 | 1.625 | 2.6875 | 0.60 |
+| 384 | 7 | 1.875 | 3.5625 | **0.53** |
+
+**Both paths reuse.** Neither grows like `N` windows, so the earlier claim that
+the fallback's varying widths prevent slot sharing was wrong.
+
+**But they scale differently, and the mechanism is the one predicted before the
+run.** Both have the *same maximum* buffer width at every `W`; what differs is
+the number of distinct block widths — the fallback carries `min(N, W/64 + 1)`,
+the rolled path exactly one. Over `W = 192 → 384` the rolled pool grows about
+2730 bytes per row of window (~one buffer, 2048) while the fallback grows about
+12288 (~six). The fallback's memory tracks its *shape count*, which is a
+partial version of the all-at-once profile this design was chosen to avoid.
+
+Below `W = 192` the two are within one quantisation step and trade places; the
+separation begins where the shape count does and is monotone thereafter.
+
+**This extrapolates the wrong way for the fallback.** At Gemma 3's default
+`W = 4096` with `Lq = 8192`, the fallback carries `min(128, 65) = 65` distinct
+widths against the rolled path's one. The 1.9x measured at `W = 384` is the
+small end of that curve.
+
+**Kernel launches are identical — 10 for 8 blocks, on both paths, at every
+window.** So the sequential cost §0 accepted as rolling's price does not exist
+at these sizes: Inductor fuses the unrolled block loop the same way either way.
+Rolling is not trading launches for memory here; it is simply using less.
+
+Caveat: `pool_size` is planned scratch, not measured peak HBM, and everything
+above is at `Lq = 512`.
+
 **R6: still no device loop, and now properly measured.** Isolated caches, and
 the roll branch's entry counted during tracing (1 with the flag on, 0 with it
 off), so the two paths are known to have traced differently. Both emit 6
