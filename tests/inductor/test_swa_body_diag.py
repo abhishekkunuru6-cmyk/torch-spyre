@@ -14,9 +14,9 @@
 
 """Bisect the rolled-window body, one construct at a time.
 
-_window_roll_attention adds several constructs at once, so this file builds
-one iteration of it up in stages on a single shape. The first stage that fails
-names the culprit, which is otherwise a compile error with no line number.
+_window_roll_attention adds several constructs at once, so this file builds one
+iteration of it up in stages. The first stage that fails names the culprit,
+which is otherwise a compile error or a wrong number with no line attached.
 
   A  gather + matmul                                (rank 4, one block)
   B  A + the rank-4 band
@@ -25,21 +25,26 @@ names the culprit, which is otherwise a compile error with no line number.
   E  D + the four spyre_hints                       (== one loop iteration)
   F  E over every block, concatenated               (== the whole body)
 
-Stages A-E run block 2 -- the first block whose read start is not 0, so a
-dropped window shift shows up here rather than passing by accident.
+Two shapes run the same ladder:
 
-This file replaces the earlier bisect of the abandoned all-at-once body. That
-one was chasing
+  PREFILL  Lq=Lkv=256, W=64  -> q_block=64, 4 blocks, buffer_width=128. Green
+           as of 2026-07-30, A through F.
+  DECODE   Lq=1, Lkv=4096, W=64 -> q_block=1, 1 block, buffer_width=64. This
+           is the shape test_swa_window_roll_kernel.py fails on, and it fails
+           there *identically with the rolled path on and off* -- at Lq=1 both
+           paths read the same [4032, 4096) window and do the same math, so
+           the bug is in the shared body, not in either window strategy.
 
-    RuntimeError: Incompatible host_size and dim_order
-    (spyre_tensor_impl.cpp:147 -- a tensor's host_size and dim_order disagree
-     in length, i.e. a rank mismatch)
+           What is unique to it: buffer_width is exactly ONE stick. Every
+           passing shape has two or more (prefill W=64 gives 128; decode GQA
+           W=128 gives 128). If a stage fails here that passes on prefill,
+           a single-stick KV extent is the difference.
 
-whose prime suspect was that body's rank-5 band view,
-scores.view(B, N, Hq, qb, Wb) + band. Rolling has no fold and therefore no
-rank-5 anything, so if the stages below pass, that failure was the fold's and
-died with it. If A or B still fails, the problem is in the shared flash body
-and would have bitten either design.
+Stages A-E run the first block with a nonzero read start, so a dropped window
+shift cannot pass by accident. Bands are always built outside the traced
+function: building them inside pulls CPU mask construction into the graph and
+crashes make_buffer_reuse on the resulting bool buffers, which the real body
+never does -- its band comes from spyre.window_band_mask, opaque to dynamo.
 
 Run:
     SENCORES=1 python3 -m pytest tests/inductor/test_swa_body_diag.py -v
@@ -56,78 +61,179 @@ from utils_inductor import cached_randn, compare_with_cpu
 
 BATCH = 1
 HEADS = 8
-SEQLEN = 256
 HEAD_DIM = 64
-WINDOW = 64
-Q_BLOCK = 64
-
-PLAN = plan_window_gather(SEQLEN, SEQLEN, WINDOW, q_block=Q_BLOCK)
-assert PLAN is not None
-BUFFER_WIDTH = PLAN.buffer_width
 SCALE = 1.0 / math.sqrt(math.sqrt(HEAD_DIM))
 
-# The first block that reads from a nonzero offset.
-BLOCK = 2
-assert PLAN.read_start(BLOCK) > 0
 
+class _BodyLadder:
+    """The staged body, shared by every shape. Not a TestCase on its own."""
 
-def _inputs():
-    query = cached_randn(
-        (BATCH, HEADS, SEQLEN, HEAD_DIM), differentiation=1, dtype=torch.float16
-    )
-    key = cached_randn(
-        (BATCH, HEADS, SEQLEN, HEAD_DIM), differentiation=2, dtype=torch.float16
-    )
-    value = cached_randn(
-        (BATCH, HEADS, SEQLEN, HEAD_DIM), differentiation=3, dtype=torch.float16
-    )
-    return query, key, value
+    seqlen_q = 256
+    seqlen_kv = 256
+    window = 64
+    q_block = 64
 
+    @classmethod
+    def setUpClass(cls):
+        cls.plan = plan_window_gather(
+            cls.seqlen_q, cls.seqlen_kv, cls.window, q_block=cls.q_block
+        )
+        assert cls.plan is not None, f"shape not supported: {cls.__name__}"
+        # The first block that reads from a nonzero offset, so the window shift
+        # is exercised rather than trivially zero.
+        cls.block = next(
+            (n for n in range(cls.plan.num_q_blocks) if cls.plan.read_start(n) > 0),
+            0,
+        )
 
-def _band(block_index: int = BLOCK) -> torch.Tensor:
-    """[1, 1, q_block, Wb] additive band for one block."""
-    columns = torch.arange(BUFFER_WIDTH)
-    start = PLAN.read_start(block_index)
-    q_start, _ = PLAN.block_q_range(block_index)
-    rows = []
-    for offset in range(PLAN.q_block):
-        low, high = PLAN.row_window(q_start + offset)
-        rows.append((columns + start >= low) & (columns + start < high))
-    allowed = torch.stack(rows)
-    band = torch.zeros(allowed.shape, dtype=torch.float16)
-    band.masked_fill_(~allowed, float("-inf"))
-    return band.unsqueeze(0).unsqueeze(0)
+    def inputs(self):
+        query = cached_randn(
+            (BATCH, HEADS, self.seqlen_q, HEAD_DIM),
+            differentiation=1,
+            dtype=torch.float16,
+        )
+        key = cached_randn(
+            (BATCH, HEADS, self.seqlen_kv, HEAD_DIM),
+            differentiation=2,
+            dtype=torch.float16,
+        )
+        value = cached_randn(
+            (BATCH, HEADS, self.seqlen_kv, HEAD_DIM),
+            differentiation=3,
+            dtype=torch.float16,
+        )
+        return query, key, value
 
+    def band(self, block_index=None):
+        """[1, 1, q_block, Wb] additive band for one block."""
+        plan = self.plan
+        block_index = self.block if block_index is None else block_index
+        columns = torch.arange(plan.buffer_width)
+        start = plan.read_start(block_index)
+        q_start, _ = plan.block_q_range(block_index)
+        rows = []
+        for offset in range(plan.q_block):
+            low, high = plan.row_window(q_start + offset)
+            rows.append((columns + start >= low) & (columns + start < high))
+        allowed = torch.stack(rows)
+        band = torch.zeros(allowed.shape, dtype=torch.float16)
+        band.masked_fill_(~allowed, float("-inf"))
+        return band.unsqueeze(0).unsqueeze(0)
 
-def _gather(key: torch.Tensor, value: torch.Tensor, block_index: int = BLOCK):
-    """Op on spyre, the equivalent slices on CPU."""
-    start = PLAN.read_start(block_index)
-    q_start, _ = PLAN.block_q_range(block_index)
-    if key.device.type == "spyre":
-        return torch.ops.spyre.gather_kv_window(
-            key,
-            value,
-            start,
-            BUFFER_WIDTH,
-            HEADS,
-            Q_BLOCK,
-            PLAN.q_kv_offset + q_start,
-            WINDOW,
-            True,
-        )[:2]
-    k_win = key[:, :, start : start + BUFFER_WIDTH, :].transpose(-1, -2)
-    v_win = value[:, :, start : start + BUFFER_WIDTH, :]
-    return k_win, v_win
+    def gather(self, key, value, block_index=None):
+        """Op on spyre, the equivalent slices on CPU."""
+        plan = self.plan
+        block_index = self.block if block_index is None else block_index
+        start = plan.read_start(block_index)
+        q_start, _ = plan.block_q_range(block_index)
+        width = plan.buffer_width
+        if key.device.type == "spyre":
+            return torch.ops.spyre.gather_kv_window(
+                key,
+                value,
+                start,
+                width,
+                HEADS,
+                plan.q_block,
+                plan.q_kv_offset + q_start,
+                plan.window_size,
+                True,
+            )[:2]
+        k_win = key[:, :, start : start + width, :].transpose(-1, -2)
+        v_win = value[:, :, start : start + width, :]
+        return k_win, v_win
 
+    def q_rows(self, query, block_index=None):
+        block_index = self.block if block_index is None else block_index
+        q_start, q_end = self.plan.block_q_range(block_index)
+        return query[:, :, q_start:q_end, :]
 
-def _q_rows(query: torch.Tensor, block_index: int = BLOCK) -> torch.Tensor:
-    q_start, q_end = PLAN.block_q_range(block_index)
-    return query[:, :, q_start:q_end, :]
+    def scores(self, query, key, value, block_index=None):
+        k_win, _ = self.gather(key, value, block_index)
+        return torch.matmul(self.q_rows(query, block_index) * SCALE, k_win * SCALE)
 
+    def accumulated_block(self, q, k, v, band, block_index=None):
+        """One block through the full accumulator body, without the hints."""
+        q_block = self.plan.q_block
+        k_win, v_win = self.gather(k, v, block_index)
+        running_max = torch.full(
+            (BATCH, HEADS, q_block, 64), float("-inf"), device=q.device, dtype=q.dtype
+        ).amax(dim=-1)
+        denominator = torch.zeros(
+            (BATCH, HEADS, q_block, 64), device=q.device, dtype=q.dtype
+        ).amax(dim=-1)
+        output = torch.zeros(
+            (BATCH, HEADS, q_block, HEAD_DIM), device=q.device, dtype=q.dtype
+        )
 
-def _scores(query, key, value, block_index: int = BLOCK):
-    k_win, _ = _gather(key, value, block_index)
-    return torch.matmul(_q_rows(query, block_index) * SCALE, k_win * SCALE)
+        scores = torch.matmul(self.q_rows(q, block_index) * SCALE, k_win * SCALE) + band
+        block_max = torch.amax(scores, dim=-1)
+        max_running = torch.maximum(running_max, block_max)
+        exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
+        correction = torch.exp(running_max - max_running)
+        denominator = _copy_into(
+            denominator * correction + exp_scores.sum(dim=-1), denominator
+        )
+        output = _copy_into(
+            output * correction.unsqueeze(-1) + torch.matmul(exp_scores, v_win),
+            output,
+        )
+        return _copy_into(output / denominator.unsqueeze(-1), output)
+
+    # ------------------------------------------------------------------ stages
+
+    def test_a_gather_and_matmul(self):
+        compare_with_cpu(
+            lambda q, k, v: self.scores(q, k, v), *self.inputs(), run_eager=False
+        )
+
+    def test_b_band(self):
+        def fn(q, k, v, band):
+            return self.scores(q, k, v) + band
+
+        compare_with_cpu(fn, *self.inputs(), self.band(), run_eager=False)
+
+    def test_c_softmax_and_second_matmul(self):
+        def fn(q, k, v, band):
+            k_win, v_win = self.gather(k, v)
+            scores = torch.matmul(self.q_rows(q) * SCALE, k_win * SCALE) + band
+            block_max = torch.amax(scores, dim=-1)
+            exp_scores = torch.exp(scores - block_max.unsqueeze(-1))
+            denominator = exp_scores.sum(dim=-1)
+            return torch.matmul(exp_scores, v_win) / denominator.unsqueeze(-1)
+
+        compare_with_cpu(fn, *self.inputs(), self.band(), run_eager=False)
+
+    def test_d_online_softmax_accumulators(self):
+        def fn(q, k, v, band):
+            return self.accumulated_block(q, k, v, band)
+
+        compare_with_cpu(fn, *self.inputs(), self.band(), run_eager=False)
+
+    def test_e_with_hints(self):
+        width_tiles = max(1, self.plan.buffer_width // 64)
+
+        def fn(q, k, v, band):
+            with spyre_hint(tiles={"batch_size": max(1, BATCH // 2)}):
+                with spyre_hint(tiles={"num_heads": max(1, HEADS // 4)}):
+                    with spyre_hint(tiles={"window_size": width_tiles}):
+                        with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
+                            return self.accumulated_block(q, k, v, band)
+
+        compare_with_cpu(fn, *self.inputs(), self.band(), run_eager=False)
+
+    def test_f_every_block_concatenated(self):
+        # The loop itself. Fails here with E passing => the repetition.
+        bands = [self.band(n) for n in range(self.plan.num_q_blocks)]
+
+        def fn(q, k, v, *block_bands):
+            blocks = [
+                self.accumulated_block(q, k, v, band, n)
+                for n, band in enumerate(block_bands)
+            ]
+            return torch.cat(blocks, dim=2)
+
+        compare_with_cpu(fn, *self.inputs(), *bands, run_eager=False)
 
 
 def _copy_into(new: torch.Tensor, destination: torch.Tensor) -> torch.Tensor:
@@ -142,96 +248,28 @@ def _copy_into(new: torch.Tensor, destination: torch.Tensor) -> torch.Tensor:
     return new
 
 
-def _accumulated_block(q, k, v, band, block_index: int = BLOCK):
-    """One block through the full accumulator body, without the hints."""
-    k_win, v_win = _gather(k, v, block_index)
-    running_max = torch.full(
-        (BATCH, HEADS, Q_BLOCK, 64), float("-inf"), device=q.device, dtype=q.dtype
-    ).amax(dim=-1)
-    denominator = torch.zeros(
-        (BATCH, HEADS, Q_BLOCK, 64), device=q.device, dtype=q.dtype
-    ).amax(dim=-1)
-    output = torch.zeros(
-        (BATCH, HEADS, Q_BLOCK, HEAD_DIM), device=q.device, dtype=q.dtype
-    )
-
-    scores = torch.matmul(_q_rows(q, block_index) * SCALE, k_win * SCALE) + band
-    block_max = torch.amax(scores, dim=-1)
-    max_running = torch.maximum(running_max, block_max)
-    exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
-    correction = torch.exp(running_max - max_running)
-    denominator = _copy_into(
-        denominator * correction + exp_scores.sum(dim=-1), denominator
-    )
-    output = _copy_into(
-        output * correction.unsqueeze(-1) + torch.matmul(exp_scores, v_win),
-        output,
-    )
-    return _copy_into(output / denominator.unsqueeze(-1), output)
+class TestPrefillBody(_BodyLadder, unittest.TestCase):
+    """Lq=Lkv=256, W=64 -> 4 blocks of 64, buffer_width=128. Green."""
 
 
-class TestBodyBisect(unittest.TestCase):
-    def test_a_gather_and_matmul(self):
-        def fn(q, k, v):
-            return _scores(q, k, v)
+class TestDecodeBody(_BodyLadder, unittest.TestCase):
+    """Lq=1, Lkv=4096, W=64 -> one block, buffer_width=64: ONE stick.
 
-        compare_with_cpu(fn, *_inputs(), run_eager=False)
+    The shape the end-to-end test fails, identically with the rolled path on
+    and off. Whichever stage fails here first is where the shared body breaks
+    at a single-stick KV extent.
+    """
 
-    def test_b_band(self):
-        def fn(q, k, v, band):
-            return _scores(q, k, v) + band
+    seqlen_q = 1
+    seqlen_kv = 4096
+    window = 64
+    q_block = 1
 
-        compare_with_cpu(fn, *_inputs(), _band(), run_eager=False)
-
-    def test_c_softmax_and_second_matmul(self):
-        def fn(q, k, v, band):
-            k_win, v_win = _gather(k, v)
-            scores = torch.matmul(_q_rows(q) * SCALE, k_win * SCALE) + band
-            block_max = torch.amax(scores, dim=-1)
-            exp_scores = torch.exp(scores - block_max.unsqueeze(-1))
-            denominator = exp_scores.sum(dim=-1)
-            return torch.matmul(exp_scores, v_win) / denominator.unsqueeze(-1)
-
-        compare_with_cpu(fn, *_inputs(), _band(), run_eager=False)
-
-    def test_d_online_softmax_accumulators(self):
-        def fn(q, k, v, band):
-            return _accumulated_block(q, k, v, band)
-
-        compare_with_cpu(fn, *_inputs(), _band(), run_eager=False)
-
-    def test_e_with_hints(self):
-        def fn(q, k, v, band):
-            with spyre_hint(tiles={"batch_size": max(1, BATCH // 2)}):
-                with spyre_hint(tiles={"num_heads": max(1, HEADS // 4)}):
-                    with spyre_hint(tiles={"window_size": max(1, BUFFER_WIDTH // 64)}):
-                        with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
-                            return _accumulated_block(q, k, v, band)
-
-        compare_with_cpu(fn, *_inputs(), _band(), run_eager=False)
-
-    def test_f_every_block_concatenated(self):
-        # The loop itself: N independent iterations, cat along the sequence.
-        # Fails here with E passing => the repetition, not the body.
-        #
-        # The bands are built OUTSIDE fn and passed in, as in every stage
-        # above. Building them inside traces the CPU mask construction --
-        # arange, comparisons, masked_fill_ -- into the graph, which crashes
-        # make_buffer_reuse on the resulting bool buffers ('FixedLayout' has no
-        # attribute 'device_layout'). The real body never does that: its band
-        # comes from spyre.window_band_mask, a custom op that is opaque to
-        # dynamo. That crash is a genuine backend bug, but it is not on this
-        # path and must not be what this stage measures.
-        bands = [_band(n) for n in range(PLAN.num_q_blocks)]
-
-        def fn(q, k, v, *block_bands):
-            blocks = [
-                _accumulated_block(q, k, v, band, n)
-                for n, band in enumerate(block_bands)
-            ]
-            return torch.cat(blocks, dim=2)
-
-        compare_with_cpu(fn, *_inputs(), *bands, run_eager=False)
+    def test_the_window_is_a_single_stick(self):
+        # The one structural difference from every shape that passes.
+        self.assertEqual(self.plan.buffer_width, 64)
+        self.assertEqual(self.plan.num_q_blocks, 1)
+        self.assertEqual(self.plan.read_start(0), 4032)
 
 
 if __name__ == "__main__":
