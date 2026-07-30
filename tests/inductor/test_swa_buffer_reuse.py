@@ -63,8 +63,8 @@ WINDOWS = (64, 128, 192, 256)
 BYTES_PER_WINDOW_ROW = 2 * BATCH * HEADS * HEAD_DIM * 2
 
 
-def _compile_and_measure(window: int) -> tuple[int, int]:
-    """Compile SWA at one window size; return (pool_size, gather call count)."""
+def _compile_and_measure(window: int, roll: bool = True) -> tuple[int, int]:
+    """Compile SWA at one window size; return (pool_size, kernel call count)."""
     query = cached_randn(
         (BATCH, HEADS, SEQLEN, HEAD_DIM), differentiation=1, dtype=torch.float16
     )
@@ -76,7 +76,7 @@ def _compile_and_measure(window: int) -> tuple[int, int]:
     )
 
     saved = spyre_config.swa_window_roll
-    spyre_config.swa_window_roll = True
+    spyre_config.swa_window_roll = roll
     torch._dynamo.reset()
     try:
         with isolated_inductor_cache():
@@ -139,6 +139,44 @@ class TestWindowBufferIsReused(unittest.TestCase):
             f"blocks, so rolling is paying sequential launches for the "
             f"all-at-once memory profile",
         )
+
+    def test_rolled_against_the_unrolled_fallback(self):
+        """The comparison that decides whether rolling was worth doing.
+
+        R5 establishes that the rolled path reuses its window buffer. It does
+        NOT establish that the unrolled fallback fails to -- and there is good
+        reason to think it does too: at W=64 seven of its eight blocks are the
+        same 128 rows wide, and Inductor will reuse a larger buffer for a
+        smaller need, so one buffer of the maximum size covers every block
+        there as well.
+
+        If the two pools track each other, rolling's constant shape bought
+        nothing the fallback did not already have, and the fallback reads
+        strictly fewer KV rows besides -- its early blocks are narrower where
+        the rolled path shifts its read and masks the overhang. That would
+        make the honest recommendation to keep the simpler code.
+        """
+        print(f"\n=== R5b: rolled vs unrolled (Lq={SEQLEN}) ===")
+        print(
+            f"{'W':>5} {'rolled pool':>13} {'fallback pool':>15} {'r kern':>8} {'f kern':>8}"
+        )
+        rolled_pools, fallback_pools = [], []
+        for window in WINDOWS:
+            rolled, rolled_kernels = _compile_and_measure(window, roll=True)
+            fallback, fallback_kernels = _compile_and_measure(window, roll=False)
+            rolled_pools.append(rolled)
+            fallback_pools.append(fallback)
+            print(
+                f"{window:>5} {rolled:>13} {fallback:>15} "
+                f"{rolled_kernels:>8} {fallback_kernels:>8}"
+            )
+
+        ratio = max(rolled_pools) / max(fallback_pools)
+        print(f"peak pool ratio rolled/fallback: {ratio:.2f}")
+        # Not an assertion about which wins -- only that the comparison ran.
+        # The number is the deliverable; a threshold here would be inventing a
+        # success criterion nobody agreed to.
+        self.assertGreater(min(fallback_pools), 0)
 
     def test_kernel_count_grows_with_the_block_count(self):
         # The cost side of the same trade: rolling is N sequential launches by
