@@ -204,6 +204,50 @@ class TestGatherKVWindow(unittest.TestCase):
 
         compare_with_cpu(fn, self._cache(1), self._cache(2), run_eager=False)
 
+    def test_decode_band(self):
+        # The last piece of the decode shape never tested at the op level. The
+        # body ladder builds its band on CPU and passes it in, so the op's own
+        # band has only ever been checked at prefill -- and a corrupted band is
+        # exactly the failure shape decode shows: right window, right data,
+        # partially wrong numbers, because softmax is what consumes it.
+        #
+        # At decode the band is entirely zeros: buffer_width == window, so the
+        # single row can attend to every column. That makes garbage easy to
+        # see and makes a wrong -inf impossible to miss.
+        plan = _plan(seqlen_q=1, seqlen_kv=4096, q_block=1)
+        cache = cached_randn(
+            (BATCH, HEADS, 4096, HEAD_DIM), differentiation=3, dtype=torch.float16
+        )
+
+        def fn(k, v):
+            if k.device.type == "spyre":
+                return _gather_block(k, plan, 0, HEADS, 2)
+            return _reference_band(plan, 0)
+
+        compare_with_cpu(fn, cache, cache, run_eager=False)
+
+    def test_decode_band_is_all_zeros(self):
+        # Guards the test above from passing by agreeing on garbage.
+        plan = _plan(seqlen_q=1, seqlen_kv=4096, q_block=1)
+        band = _reference_band(plan, 0)
+        self.assertEqual(band.shape, (1, 1, 1, 64))
+        self.assertTrue(torch.equal(band, torch.zeros_like(band)))
+
+    def test_decode_value_window(self):
+        # k_win at decode is covered below; v_win is not, and it is the other
+        # operand of the second matmul.
+        plan = _plan(seqlen_q=1, seqlen_kv=4096, q_block=1)
+        cache = cached_randn(
+            (BATCH, HEADS, 4096, HEAD_DIM), differentiation=3, dtype=torch.float16
+        )
+
+        def fn(k, v):
+            if k.device.type == "spyre":
+                return _gather_block(v, plan, 0, HEADS, 1)
+            return _reference_window(v, plan, 0, HEADS)
+
+        compare_with_cpu(fn, cache, cache, run_eager=False)
+
     def test_decode(self):
         # Lq=1 is not a multiple of 64, so decode uses q_block=1 -- one Q block
         # with no intra-block stagger, giving buffer_width == window exactly.
