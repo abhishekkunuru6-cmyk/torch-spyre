@@ -38,6 +38,7 @@ Run on hardware:
 """
 
 import os
+import time
 import unittest
 
 import torch
@@ -45,7 +46,7 @@ import torch._dynamo
 from torch._inductor import config as inductor_config
 from torch._inductor.runtime.runtime_utils import cache_dir
 
-from bundle_structure import bundle_dirs, parse_bundle_mlir, read_new_bundles
+from bundle_structure import find_bundles_since, parse_bundle_mlir
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor import decompositions
 from torch_spyre._inductor.swa_window_gather import plan_window_gather
@@ -110,8 +111,8 @@ def _compile_swa(roll_enabled: bool):
     bundle.mlir before dxp_standalone runs, so a failed compile still leaves
     structure worth reading.
     """
-    root = _spyre_cache_root()
-    before = bundle_dirs(root)
+    started = time.time()
+    roots = {_spyre_cache_root()}
 
     entries: list = []
     original_plan = decompositions.plan_window_gather
@@ -142,6 +143,9 @@ def _compile_swa(roll_enabled: bool):
                 f"\n[compile raised, reading structure anyway] "
                 f"{type(exc).__name__}: {exc}"
             )
+        # Sampled while the cache config is still in force: that is what moves
+        # cache_dir(), so this is where the bundles actually landed.
+        roots.add(_spyre_cache_root())
     finally:
         spyre_config.swa_window_roll = saved_flag
         decompositions.plan_window_gather = original_plan
@@ -149,7 +153,7 @@ def _compile_swa(roll_enabled: bool):
             inductor_config.force_disable_caches = saved_caches
         torch._dynamo.reset()
 
-    return read_new_bundles(root, before), len(entries)
+    return find_bundles_since(roots, started), len(entries)
 
 
 def _print_report(label: str, structures, roll_entries: int) -> None:

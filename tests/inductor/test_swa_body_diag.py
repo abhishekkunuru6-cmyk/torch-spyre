@@ -212,15 +212,26 @@ class TestBodyBisect(unittest.TestCase):
 
     def test_f_every_block_concatenated(self):
         # The loop itself: N independent iterations, cat along the sequence.
-        # Fails here with D passing => the repetition, not the body.
-        def fn(q, k, v):
+        # Fails here with E passing => the repetition, not the body.
+        #
+        # The bands are built OUTSIDE fn and passed in, as in every stage
+        # above. Building them inside traces the CPU mask construction --
+        # arange, comparisons, masked_fill_ -- into the graph, which crashes
+        # make_buffer_reuse on the resulting bool buffers ('FixedLayout' has no
+        # attribute 'device_layout'). The real body never does that: its band
+        # comes from spyre.window_band_mask, a custom op that is opaque to
+        # dynamo. That crash is a genuine backend bug, but it is not on this
+        # path and must not be what this stage measures.
+        bands = [_band(n) for n in range(PLAN.num_q_blocks)]
+
+        def fn(q, k, v, *block_bands):
             blocks = [
-                _accumulated_block(q, k, v, _band(n).to(q.device), n)
-                for n in range(PLAN.num_q_blocks)
+                _accumulated_block(q, k, v, band, n)
+                for n, band in enumerate(block_bands)
             ]
             return torch.cat(blocks, dim=2)
 
-        compare_with_cpu(fn, *_inputs(), run_eager=False)
+        compare_with_cpu(fn, *_inputs(), *bands, run_eager=False)
 
 
 if __name__ == "__main__":

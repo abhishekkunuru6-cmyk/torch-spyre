@@ -161,28 +161,29 @@ def read_bundle(path: str) -> BundleStructure:
         return parse_bundle_mlir(handle.read(), path=path)
 
 
-def bundle_dirs(root: str) -> set[str]:
-    """Every kernel output directory currently under an inductor-spyre root."""
-    if not os.path.isdir(root):
-        return set()
-    return {
-        os.path.join(root, name)
-        for name in os.listdir(root)
-        if os.path.isdir(os.path.join(root, name))
-    }
+def find_bundles_since(roots, timestamp: float) -> list[BundleStructure]:
+    """Parse every bundle.mlir under ``roots`` written at or after ``timestamp``.
 
+    Selection is by mtime across several roots rather than by set-difference on
+    one, because the root itself moves: disabling inductor's caches sends
+    cache_dir() to a fresh temporary directory, so a root sampled before the
+    compile is not where the bundles land. Pass both the before and after
+    roots and let the timestamp decide.
 
-def read_new_bundles(root: str, before: set[str]) -> list[BundleStructure]:
-    """Parse every bundle.mlir written since ``before`` was taken.
-
-    Sorted by path so a run's output is stable, and tolerant of a directory
-    with no bundle.mlir: dxp_standalone runs *after* generate_bundle, so a
-    failed backend compile still leaves a parseable bundle -- which is exactly
-    when its structure is most worth reading.
+    Tolerant of a directory with no bundle.mlir: dxp_standalone runs *after*
+    generate_bundle, so a failed backend compile still leaves a parseable
+    bundle -- which is exactly when its structure is most worth reading.
     """
     structures = []
-    for directory in sorted(bundle_dirs(root) - before):
-        candidate = os.path.join(directory, "bundle.mlir")
-        if os.path.isfile(candidate):
-            structures.append(read_bundle(candidate))
+    seen: set[str] = set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            candidate = os.path.join(root, name, "bundle.mlir")
+            if candidate in seen or not os.path.isfile(candidate):
+                continue
+            if os.path.getmtime(candidate) >= timestamp:
+                seen.add(candidate)
+                structures.append(read_bundle(candidate))
     return structures

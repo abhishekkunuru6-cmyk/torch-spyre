@@ -245,6 +245,44 @@ that is not expressed by the graph. Two designs now agree that windowed tiling
 is not reaching the device, which is a backend-level finding and worth more
 than a third body variant. Take it to Antoni before spending on R7 onward.
 
+## 4b. Second run: the body is green, the null is not yet measured
+
+**The flag is honored.** `plan_window_gather` was entered once with the flag on
+and zero times with it off. So the two paths genuinely trace differently, and
+the identical first-run totals were *not* a no-op flag — but see below, they may
+still have been one path's cached artifact reported twice.
+
+**One iteration of the body is fully green.** A, B, C, **D** (accumulators) and
+**E** (all four hints) pass. That is §3's structure, complete, on device. Only F
+(every block, concatenated) failed, on `AttributeError: 'FixedLayout' object has
+no attribute 'device_layout'` in `make_buffer_reuse` (`wrapper.py:156`) over a
+`torch.bool` buffer — the test built its bands *inside* the traced function, so
+CPU mask construction entered the graph. The real body's band comes from
+`spyre.window_band_mask`, a custom op opaque to dynamo, so this is off our path.
+Bands are now passed in like every other stage. **The crash is still a real
+backend bug worth filing** — `make_buffer_reuse` assumes every layout is a
+`FixedTiledLayout`.
+
+**GQA is answered.** Single-block GQA **passes**; only the `cat` probe fails,
+with the zeroed-slot signature. So the limitation is `cat` of expanded
+(stride-0) buffers, *not* the expand inside the gather — and the body never cats
+gathered windows. GQA is fine for this design. Also worth filing.
+
+**The R6 null is not yet measured.** The second run emitted **zero** bundles on
+both paths: disabling inductor's caches moves `cache_dir()` to a fresh temporary
+directory, and the root was sampled before the flag was set. Now found by mtime
+across both roots. Note what forced the cache flag in the first place: the
+config is read during *lowering*, after the FX cache key is computed, so **the
+two paths share a cache key** and one can replay the other's artifact. That is
+the likeliest reading of the first run's identical totals.
+
+**The unroller is not the explanation.** `UNROLL_LOOPS` and
+`codegen/unroll.py` were deleted in #3235, already on this branch, so `scf.for`
+is the only path — flat `sdsc_execute` means no `LoopSpec` was created, not a
+loop that got flattened. Backend loop support requiring compile-time trip
+counts is also not the blocker: every count here (`Wb//64 = 2`, `N = 4`) is a
+compile-time int.
+
 ## 5. Risks, in order
 
 1. **The rolling may not roll** (§2). The whole justification for choosing this
