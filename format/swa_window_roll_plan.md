@@ -283,6 +283,47 @@ loop that got flattened. Backend loop support requiring compile-time trip
 counts is also not the blocker: every count here (`Wb//64 = 2`, `N = 4`) is a
 compile-time int.
 
+## 4c. R5 and R6 measured (2026-07-30)
+
+**R5: the buffer is reused. The design's one claim holds.** Sweeping the window
+at a fixed `Lq=512` (8 blocks), so nothing but the window varies:
+
+| `W` | `buffer_width` | `pool_size` | kernels |
+|---:|---:|---:|---:|
+| 64 | 128 | 1048576 | 10 |
+| 128 | 192 | 1310720 | 10 |
+| 192 | 256 | 1441792 | 10 |
+| 256 | 320 | 1441792 | 10 |
+
+**2048 bytes of planned scratch per row of `buffer_width`** — exactly one
+window pair (`2 x B x H x D x 2` at fp16). Eight live windows would be 16384,
+and would have taken the pool from 1 MiB to over 4 MiB; it went to 1.375 MiB.
+Peak scratch tracks **one** window while eight blocks run, which is the whole
+reason rolling was chosen over materialising all `N`.
+
+Read the slope as an order-of-magnitude result, not a precise one: the pool is
+clearly quantised (the last step is flat, the per-step deltas are 4096, 2048,
+0), and `pool_size` is planned scratch rather than measured peak HBM. The
+discrimination was 8x, far past that noise.
+
+**The sequential cost is smaller than the plan assumed.** 10 kernel calls for
+8 blocks, constant in `W` — Inductor fuses across the unrolled block loop, so
+"one kernel launch per tile" over-counts. §3's worry about `N` launches at
+large `Lq` should be re-measured before it drives a `T` sweep.
+
+**R6: still no device loop, and now properly measured.** Isolated caches, and
+the roll branch's entry counted during tracing (1 with the flag on, 0 with it
+off), so the two paths are known to have traced differently. Both emit 6
+bundles, 96 flat `sdsc_execute`, **0 `scf.for`**. The identical totals were not
+a cache artifact: the two designs genuinely compile to the same structure, and
+neither tiles over the window.
+
+**So the accumulators are currently dead weight.** With no window loop each
+block is a single pass: `M` is `-inf`, `correction` is `exp(-inf) == 0`, and
+the running terms drop out. They stay because they are what makes the body
+legal if the hint ever starts producing a loop, but today they are cost with no
+benefit. Detail in `format/swa_backend_bugs.md` issue 6.
+
 ## 5. Risks, in order
 
 1. **The rolling may not roll** (§2). The whole justification for choosing this
