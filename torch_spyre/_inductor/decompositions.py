@@ -1016,6 +1016,20 @@ def spyre_sliding_window_attention(
             k_blk = k_slice
             v_blk = v_slice
 
+        # True when this block's rows can attend every column of the slice, so
+        # the band is all zeros and adding it is a no-op. Decode is always that
+        # case: one row whose window is exactly the stick-rounded slice.
+        #
+        # Adding it anyway is not merely wasted work -- it returns wrong
+        # numbers. At Lq=1, Lkv=4096, W=64 this decomposition disagreed with a
+        # masked SDPA reference on 199 of 512 output elements while every
+        # component checked out in isolation, and skipping the provably-empty
+        # add is what fixed it. Same trigger, same fix, as the rolled path.
+        band_masks_nothing = is_causal and all(
+            max(0, q_kv_offset + q - window_size + 1) <= kv_start
+            and min(max_seqlen_kv, q_kv_offset + q + 1) >= kv_end
+            for q in range(q_start, q_end)
+        )
         band_mask = torch.ops.spyre.sliding_window_block_mask(
             q_start,
             q_end,
@@ -1067,7 +1081,8 @@ def spyre_sliding_window_attention(
                             q_blk * scaling_factor, k_blk_T
                         )  # batch, heads, q_len, kv_len
 
-                        scores = scores + band_mask
+                        if not band_masks_nothing:
+                            scores = scores + band_mask
 
                         block_max = torch.amax(
                             scores, dim=-1
