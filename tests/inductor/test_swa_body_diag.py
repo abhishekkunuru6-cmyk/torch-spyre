@@ -130,6 +130,18 @@ def _scores(query, key, value, block_index: int = BLOCK):
     return torch.matmul(_q_rows(query, block_index) * SCALE, k_win * SCALE)
 
 
+def _copy_into(new: torch.Tensor, destination: torch.Tensor) -> torch.Tensor:
+    """spyre.copy_f on device, its value semantics on CPU.
+
+    copy_f is registered for PrivateUse1 only, so calling it on the reference
+    side raises NotImplementedError before any comparison happens. It returns
+    what it wrote, so on CPU the new value alone is the same answer.
+    """
+    if new.device.type == "spyre":
+        return torch.ops.spyre.copy_f(new, destination)
+    return new
+
+
 def _accumulated_block(q, k, v, band, block_index: int = BLOCK):
     """One block through the full accumulator body, without the hints."""
     k_win, v_win = _gather(k, v, block_index)
@@ -148,14 +160,14 @@ def _accumulated_block(q, k, v, band, block_index: int = BLOCK):
     max_running = torch.maximum(running_max, block_max)
     exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
     correction = torch.exp(running_max - max_running)
-    denominator = torch.ops.spyre.copy_f(
+    denominator = _copy_into(
         denominator * correction + exp_scores.sum(dim=-1), denominator
     )
-    output = torch.ops.spyre.copy_f(
+    output = _copy_into(
         output * correction.unsqueeze(-1) + torch.matmul(exp_scores, v_win),
         output,
     )
-    return torch.ops.spyre.copy_f(output / denominator.unsqueeze(-1), output)
+    return _copy_into(output / denominator.unsqueeze(-1), output)
 
 
 class TestBodyBisect(unittest.TestCase):

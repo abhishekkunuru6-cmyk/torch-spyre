@@ -42,10 +42,12 @@ import unittest
 
 import torch
 import torch._dynamo
+from torch._inductor import config as inductor_config
 from torch._inductor.runtime.runtime_utils import cache_dir
 
 from bundle_structure import bundle_dirs, parse_bundle_mlir, read_new_bundles
 from torch_spyre._inductor import config as spyre_config
+from torch_spyre._inductor import decompositions
 from torch_spyre._inductor.swa_window_gather import plan_window_gather
 from utils_inductor import cached_randn
 
@@ -92,7 +94,17 @@ def _inputs(device):
 
 
 def _compile_swa(roll_enabled: bool):
-    """Compile the SWA op on one path; return every bundle it emitted.
+    """Compile the SWA op on one path; return (bundles, roll_branch_entries).
+
+    Both paths emitting identical structure is a result that could equally
+    mean "the flag changed nothing in the graph", so plan_window_gather is
+    counted while tracing: it is called only under `if config.swa_window_roll`,
+    so a nonzero count is proof the rolled branch was actually taken. Without
+    that, a null result here cannot be told apart from a flag that never
+    reached the decomposition.
+
+    Inductor's caches are disabled for the same reason -- a cache hit would
+    replay the other path's artifact and look like agreement.
 
     A backend compile failure is caught, not raised: generate_bundle writes
     bundle.mlir before dxp_standalone runs, so a failed compile still leaves
@@ -101,8 +113,20 @@ def _compile_swa(roll_enabled: bool):
     root = _spyre_cache_root()
     before = bundle_dirs(root)
 
-    saved = spyre_config.swa_window_roll
+    entries: list = []
+    original_plan = decompositions.plan_window_gather
+
+    def counting_plan(*args, **kwargs):
+        plan = original_plan(*args, **kwargs)
+        entries.append(plan)
+        return plan
+
+    saved_flag = spyre_config.swa_window_roll
+    saved_caches = getattr(inductor_config, "force_disable_caches", None)
     spyre_config.swa_window_roll = roll_enabled
+    decompositions.plan_window_gather = counting_plan
+    if saved_caches is not None:
+        inductor_config.force_disable_caches = True
     torch._dynamo.reset()
     try:
         query, key, value = _inputs("spyre")
@@ -115,22 +139,27 @@ def _compile_swa(roll_enabled: bool):
             compiled(query, key, value)
         except Exception as exc:  # noqa: BLE001 -- structure still parseable
             print(
-                f"\n[compile raised, reading structure anyway] {type(exc).__name__}: {exc}"
+                f"\n[compile raised, reading structure anyway] "
+                f"{type(exc).__name__}: {exc}"
             )
     finally:
-        spyre_config.swa_window_roll = saved
+        spyre_config.swa_window_roll = saved_flag
+        decompositions.plan_window_gather = original_plan
+        if saved_caches is not None:
+            inductor_config.force_disable_caches = saved_caches
         torch._dynamo.reset()
 
-    return read_new_bundles(root, before)
+    return read_new_bundles(root, before), len(entries)
 
 
-def _print_report(label: str, structures) -> None:
+def _print_report(label: str, structures, roll_entries: int) -> None:
     plan = plan_window_gather(SEQLEN, SEQLEN, WINDOW)
     expected = None if plan is None else max(1, plan.buffer_width // 64)
     print(f"\n=== {label} ===")
     print(
         f"bundles emitted: {len(structures)}  (expected window trip count: {expected})"
     )
+    print(f"rolled branch entered: {roll_entries} time(s) during tracing")
     for structure in structures:
         print(structure.report())
     loops = sum(len(s.loops) for s in structures)
@@ -170,9 +199,21 @@ class TestBundleParser(unittest.TestCase):
 class TestWindowTilingIsReal(unittest.TestCase):
     """[HW] Compile both paths and compare their emitted loop structure."""
 
+    def test_the_flag_actually_changes_what_is_traced(self):
+        # Guards the two tests below: a null result there means nothing if the
+        # flag never reached the decomposition.
+        _, rolled_entries = _compile_swa(roll_enabled=True)
+        _, fallback_entries = _compile_swa(roll_enabled=False)
+        self.assertGreater(
+            rolled_entries, 0, "the rolled branch was never entered with the flag ON"
+        )
+        self.assertEqual(
+            fallback_entries, 0, "the rolled branch was entered with the flag OFF"
+        )
+
     def test_rolled_path_emits_a_window_loop(self):
-        structures = _compile_swa(roll_enabled=True)
-        _print_report("rolled window (SPYRE_SWA_WINDOW_ROLL=1)", structures)
+        structures, entries = _compile_swa(roll_enabled=True)
+        _print_report("rolled window (SPYRE_SWA_WINDOW_ROLL=1)", structures, entries)
 
         self.assertTrue(structures, "no bundle.mlir was emitted at all")
         plan = plan_window_gather(SEQLEN, SEQLEN, WINDOW)
@@ -187,8 +228,8 @@ class TestWindowTilingIsReal(unittest.TestCase):
     def test_unrolled_fallback_for_comparison(self):
         # Not an assertion about the fallback being right: this is the baseline
         # the rolled path has to beat, printed so the two can be compared.
-        structures = _compile_swa(roll_enabled=False)
-        _print_report("unrolled fallback (flag off)", structures)
+        structures, entries = _compile_swa(roll_enabled=False)
+        _print_report("unrolled fallback (flag off)", structures, entries)
         self.assertTrue(structures, "no bundle.mlir was emitted at all")
 
 

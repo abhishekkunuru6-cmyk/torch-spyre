@@ -141,6 +141,26 @@ class TestGatherKVWindow(unittest.TestCase):
 
     def test_key_window_gqa(self):
         # 8 query heads from 2 kv heads; the expand happens inside the gather.
+        # One block, no cat -- this is exactly what the body consumes, and it
+        # keeps the op's own correctness separate from the cat probe below.
+        plan = _plan()
+
+        def fn(k, v):
+            if k.device.type == "spyre":
+                return _gather_block(k, plan, 2, HEADS, 0)
+            return _reference_window(k, plan, 2, HEADS, transpose=True)
+
+        compare_with_cpu(
+            fn, self._cache(1, kvheads=2), self._cache(2, kvheads=2), run_eager=False
+        )
+
+    def test_gqa_windows_survive_a_cat(self):
+        # Probe, not a requirement: the body never cats gathered windows, it
+        # feeds each straight to a matmul. Cat-ing the expanded (stride-0)
+        # buffers is the construct that produced zeroed leading slots in the
+        # abandoned all-at-once design. If this fails while the single-block
+        # GQA test above passes, the limitation is the cat and the body is
+        # unaffected; if both fail, the expand inside the gather is broken.
         plan = _plan()
 
         def fn(k, v):

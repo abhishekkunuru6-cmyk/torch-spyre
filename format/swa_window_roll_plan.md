@@ -201,6 +201,50 @@ drop the *reason* from the comment rather than the code.
 **Keep slice-before-expand.** The `cat`-before-expand constraint is gone with
 the `cat`; the full-length-cache constraint is not, and is the one that matters.
 
+## 4a. What the first hardware run said (2026-07-30)
+
+Three runs, three results. The third one outranks the rest of this plan.
+
+**The body is healthy through stage C.** `test_swa_body_diag.py` A (gather +
+matmul), B (+ the rank-4 band) and C (+ softmax + second matmul) all **pass**.
+The *Incompatible host_size and dim_order* rank assertion that blocked the
+all-at-once body is **gone**, which retires it as the fold's problem — it died
+with the rank-5 band view, exactly as §1 predicted. D/E/F failed on a test bug,
+not the device: `spyre.copy_f` is registered for PrivateUse1 only and the
+helper called it on the CPU reference side too. Fixed with `_copy_into`.
+
+**GQA needs one more probe.** `test_key_window_gqa` failed with zeroed leading
+rows (5.7% of elements, `actual == 0.0` where the reference is not) — the
+signature of the abandoned design's expand→`cat` bug. But the *test* cats the
+expanded windows; the body never does, it feeds each straight to a matmul. Split
+into a single-block assertion (what the body actually does) and a `cat` probe,
+so the next run says whether the limitation is the `cat` or the expand.
+
+**Neither path produces a device loop.** `bundle.mlir` at `Lq=Lkv=256, W=64`:
+
+| | bundles | `scf.for` | `sdsc_execute` |
+|---|---:|---:|---:|
+| rolled (flag ON) | 6 | **0** | 96, all flat |
+| unrolled fallback (flag OFF) | 6 | **0** | 96, all flat |
+
+Risk 2 is now a measured fact rather than a worry, and it lands on **both**
+designs identically. The `window_size` hint is not becoming a loop for either,
+so nothing is tiled over the window in either — every numeric pass to date was
+untiled code getting the right answer with one big intermediate.
+
+*The totals being identical is itself suspicious* — it is also what you would
+see if the flag never reached the decomposition. `test_the_flag_actually_
+changes_what_is_traced` now counts `plan_window_gather` calls during tracing
+(called only under `if config.swa_window_roll`) and inductor's caches are
+disabled during the compile, so the next run can tell a real null apart from a
+flag that did nothing. **Read that test before believing the table above.**
+
+**What this does to the plan.** If the null holds, the rolled path's remaining
+claim over the unrolled fallback is memory alone (R5), and §5 risk 1 says even
+that is not expressed by the graph. Two designs now agree that windowed tiling
+is not reaching the device, which is a backend-level finding and worth more
+than a third body variant. Take it to Antoni before spending on R7 onward.
+
 ## 5. Risks, in order
 
 1. **The rolling may not roll** (§2). The whole justification for choosing this
