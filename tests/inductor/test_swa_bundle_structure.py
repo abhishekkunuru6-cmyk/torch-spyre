@@ -43,10 +43,9 @@ import unittest
 
 import torch
 import torch._dynamo
-from torch._inductor import config as inductor_config
-from torch._inductor.runtime.runtime_utils import cache_dir
 
 from bundle_structure import find_bundles_since, parse_bundle_mlir
+from inductor_cache_isolation import isolated_inductor_cache
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor import decompositions
 from torch_spyre._inductor.swa_window_gather import plan_window_gather
@@ -77,10 +76,6 @@ module {
 """
 
 
-def _spyre_cache_root() -> str:
-    return os.path.join(cache_dir(), "inductor-spyre")
-
-
 def _inputs(device):
     query = cached_randn(
         (BATCH, HEADS, SEQLEN, HEAD_DIM), differentiation=1, dtype=torch.float16
@@ -104,15 +99,16 @@ def _compile_swa(roll_enabled: bool):
     that, a null result here cannot be told apart from a flag that never
     reached the decomposition.
 
-    Inductor's caches are disabled for the same reason -- a cache hit would
-    replay the other path's artifact and look like agreement.
+    The compile also gets a private Inductor cache. The flag is read during
+    lowering, after the FX graph cache key is computed, so both paths share a
+    key and the second compile would otherwise replay the first's artifact --
+    which is what made the first run's two paths report identical structure.
 
     A backend compile failure is caught, not raised: generate_bundle writes
     bundle.mlir before dxp_standalone runs, so a failed compile still leaves
     structure worth reading.
     """
     started = time.time()
-    roots = {_spyre_cache_root()}
 
     entries: list = []
     original_plan = decompositions.plan_window_gather
@@ -123,37 +119,32 @@ def _compile_swa(roll_enabled: bool):
         return plan
 
     saved_flag = spyre_config.swa_window_roll
-    saved_caches = getattr(inductor_config, "force_disable_caches", None)
     spyre_config.swa_window_roll = roll_enabled
     decompositions.plan_window_gather = counting_plan
-    if saved_caches is not None:
-        inductor_config.force_disable_caches = True
     torch._dynamo.reset()
     try:
-        query, key, value = _inputs("spyre")
+        with isolated_inductor_cache() as cache_root:
+            query, key, value = _inputs("spyre")
 
-        def fn(q, k, v):
-            return torch.ops.spyre.sliding_window_attention(q, k, v, WINDOW, True)
+            def fn(q, k, v):
+                return torch.ops.spyre.sliding_window_attention(q, k, v, WINDOW, True)
 
-        compiled = torch.compile(fn, backend="inductor", fullgraph=True)
-        try:
-            compiled(query, key, value)
-        except Exception as exc:  # noqa: BLE001 -- structure still parseable
-            print(
-                f"\n[compile raised, reading structure anyway] "
-                f"{type(exc).__name__}: {exc}"
-            )
-        # Sampled while the cache config is still in force: that is what moves
-        # cache_dir(), so this is where the bundles actually landed.
-        roots.add(_spyre_cache_root())
+            compiled = torch.compile(fn, backend="inductor", fullgraph=True)
+            try:
+                compiled(query, key, value)
+            except Exception as exc:  # noqa: BLE001 -- structure still parseable
+                print(
+                    f"\n[compile raised, reading structure anyway] "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            root = os.path.join(cache_root, "inductor-spyre")
+            structures = find_bundles_since({root}, started)
     finally:
         spyre_config.swa_window_roll = saved_flag
         decompositions.plan_window_gather = original_plan
-        if saved_caches is not None:
-            inductor_config.force_disable_caches = saved_caches
         torch._dynamo.reset()
 
-    return find_bundles_since(roots, started), len(entries)
+    return structures, len(entries)
 
 
 def _print_report(label: str, structures, roll_entries: int) -> None:

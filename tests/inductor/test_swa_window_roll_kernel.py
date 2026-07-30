@@ -42,6 +42,7 @@ import torch
 import torch._dynamo
 import torch.nn.functional as F
 
+from inductor_cache_isolation import isolated_inductor_cache
 from torch_spyre._inductor import config as spyre_config
 from utils_inductor import cached_randn, compare_with_cpu
 
@@ -90,6 +91,10 @@ class _RollPathEnabled(unittest.TestCase):
     roll_enabled = True
 
     def setUp(self):
+        # A private cache per test: the flag is read during lowering, after the
+        # FX cache key is computed, so without this the flag-off class replays
+        # the flag-on class's artifact and both report identical numbers.
+        self.enterContext(isolated_inductor_cache())
         self._saved = spyre_config.swa_window_roll
         spyre_config.swa_window_roll = self.roll_enabled
         torch._dynamo.reset()
