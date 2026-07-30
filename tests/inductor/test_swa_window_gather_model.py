@@ -233,6 +233,56 @@ class TestNumericAgreement:
         assert (windowed - causal).abs().max().item() > 1e-3
 
 
+class TestFloat16AgreementWithTheKernelReference:
+    """Claim 3 — the kernel test's comparison, on CPU, in its own dtype.
+
+    Every claim above is float64. The device test compares against
+    F.scaled_dot_product_attention over the FULL cache behind a band mask, in
+    float16, at atol/rtol 0.1 — three differences at once, and one of them is
+    a dtype in which a 4096-wide masked softmax and a 64-wide one are no
+    longer the same computation.
+
+    This runs that exact comparison with no device involved. A failure here
+    exonerates the hardware: it would mean the reference the kernel test
+    holds the device to does not agree with the windowed algorithm in float16,
+    which is a property of the test, not of the backend.
+
+    The scale is applied as the decomposition applies it -- split across q and
+    k as sqrt(sqrt(d)) rather than once after the matmul -- because that split
+    is itself a source of float16 difference and the device does it that way.
+    """
+
+    ATOL = 0.1
+    RTOL = 0.1
+
+    @pytest.mark.parametrize(
+        "batch,heads,kvheads,seqlen_q,seqlen_kv,head_dim,window", SHAPES, ids=IDS
+    )
+    def test_windowed_matches_masked_sdpa_in_float16(
+        self, batch, heads, kvheads, seqlen_q, seqlen_kv, head_dim, window
+    ):
+        plan = plan_window_gather(seqlen_q, seqlen_kv, window)
+        assert plan is not None
+        query, key, value = _make_inputs(
+            batch, heads, kvheads, seqlen_q, seqlen_kv, head_dim
+        )
+        query, key, value = (t.to(torch.float16) for t in (query, key, value))
+
+        split = 1.0 / math.sqrt(math.sqrt(head_dim))
+        windowed = gathered_swa(query * split, key * split, value, plan, 1.0)
+
+        allowed = _reference_allowed(seqlen_q, seqlen_kv, window)
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            _additive(allowed, torch.float16),
+            enable_gqa=heads != kvheads,
+        )
+
+        torch.testing.assert_close(windowed, expected, atol=self.ATOL, rtol=self.RTOL)
+
+
 class TestWorkReduction:
     """The point of the exercise: fewer KV columns touched per Q block."""
 
