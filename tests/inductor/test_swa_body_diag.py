@@ -22,8 +22,9 @@ which is otherwise a compile error or a wrong number with no line attached.
   B  A + the rank-4 band
   C  B + softmax + second matmul
   D  C + online-softmax accumulators
-  E  D + the four spyre_hints                       (== one loop iteration)
-  F  E over every block, concatenated               (== the whole body)
+  E1 D + the four spyre_hints around everything
+  E2 D + the hints around the compute only          (== the real body)
+  F  the loop over every block, concatenated
 
 Two shapes run the same ladder:
 
@@ -50,6 +51,7 @@ Run:
     SENCORES=1 python3 -m pytest tests/inductor/test_swa_body_diag.py -v
 """
 
+from contextlib import contextmanager
 import math
 import unittest
 
@@ -152,21 +154,36 @@ class _BodyLadder:
         k_win, _ = self.gather(key, value, block_index)
         return torch.matmul(self.q_rows(query, block_index) * SCALE, k_win * SCALE)
 
-    def accumulated_block(self, q, k, v, band, block_index=None):
-        """One block through the full accumulator body, without the hints."""
+    @contextmanager
+    def hints(self):
+        """The decomposition's four hints, in its order."""
+        width_tiles = max(1, self.plan.buffer_width // 64)
+        with spyre_hint(tiles={"batch_size": max(1, BATCH // 2)}):
+            with spyre_hint(tiles={"num_heads": max(1, HEADS // 4)}):
+                with spyre_hint(tiles={"window_size": width_tiles}):
+                    with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
+                        yield
+
+    def accumulators(self, query):
+        """M / denominator / output, built as the decomposition builds them."""
         q_block = self.plan.q_block
-        k_win, v_win = self.gather(k, v, block_index)
         running_max = torch.full(
-            (BATCH, HEADS, q_block, 64), float("-inf"), device=q.device, dtype=q.dtype
+            (BATCH, HEADS, q_block, 64),
+            float("-inf"),
+            device=query.device,
+            dtype=query.dtype,
         ).amax(dim=-1)
         denominator = torch.zeros(
-            (BATCH, HEADS, q_block, 64), device=q.device, dtype=q.dtype
+            (BATCH, HEADS, q_block, 64), device=query.device, dtype=query.dtype
         ).amax(dim=-1)
         output = torch.zeros(
-            (BATCH, HEADS, q_block, HEAD_DIM), device=q.device, dtype=q.dtype
+            (BATCH, HEADS, q_block, HEAD_DIM), device=query.device, dtype=query.dtype
         )
+        return running_max, denominator, output
 
-        scores = torch.matmul(self.q_rows(q, block_index) * SCALE, k_win * SCALE) + band
+    def flash_step(self, q_rows, k_win, v_win, band, running_max, denominator, output):
+        """The compute the decomposition puts inside the hint nest."""
+        scores = torch.matmul(q_rows * SCALE, k_win * SCALE) + band
         block_max = torch.amax(scores, dim=-1)
         max_running = torch.maximum(running_max, block_max)
         exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
@@ -179,6 +196,41 @@ class _BodyLadder:
             output,
         )
         return _copy_into(output / denominator.unsqueeze(-1), output)
+
+    def accumulated_block(self, q, k, v, band, block_index=None, hint_scope="none"):
+        """One block through the accumulator body.
+
+        ``hint_scope`` decides what the hints enclose, which is the whole point
+        of stages E and E2:
+
+          "none"     no hints at all
+          "compute"  only flash_step -- what _window_roll_attention does today,
+                     with the gather and the accumulator init OUTSIDE
+          "all"      gather and init inside too
+        """
+        if hint_scope == "all":
+            with self.hints():
+                k_win, v_win = self.gather(k, v, block_index)
+                return self.flash_step(
+                    self.q_rows(q, block_index),
+                    k_win,
+                    v_win,
+                    band,
+                    *self.accumulators(q),
+                )
+
+        k_win, v_win = self.gather(k, v, block_index)
+        pieces = (
+            self.q_rows(q, block_index),
+            k_win,
+            v_win,
+            band,
+            *self.accumulators(q),
+        )
+        if hint_scope == "compute":
+            with self.hints():
+                return self.flash_step(*pieces)
+        return self.flash_step(*pieces)
 
     # ------------------------------------------------------------------ stages
 
@@ -210,15 +262,21 @@ class _BodyLadder:
 
         compare_with_cpu(fn, *self.inputs(), self.band(), run_eager=False)
 
-    def test_e_with_hints(self):
-        width_tiles = max(1, self.plan.buffer_width // 64)
-
+    def test_e1_hints_around_everything(self):
+        # Gather and accumulator init inside the hint nest. This is what the
+        # ladder measured before, and it passed at both shapes.
         def fn(q, k, v, band):
-            with spyre_hint(tiles={"batch_size": max(1, BATCH // 2)}):
-                with spyre_hint(tiles={"num_heads": max(1, HEADS // 4)}):
-                    with spyre_hint(tiles={"window_size": width_tiles}):
-                        with spyre_hint(work_div={"num_heads": 4, "window_size": 8}):
-                            return self.accumulated_block(q, k, v, band)
+            return self.accumulated_block(q, k, v, band, hint_scope="all")
+
+        compare_with_cpu(fn, *self.inputs(), self.band(), run_eager=False)
+
+    def test_e2_hints_around_compute_only(self):
+        # What _window_roll_attention actually does: the gather and the
+        # accumulator init sit OUTSIDE the hints, only flash_step is inside.
+        # E1 passing and E2 failing localises the end-to-end decode failure to
+        # that placement -- and names the one-line fix.
+        def fn(q, k, v, band):
+            return self.accumulated_block(q, k, v, band, hint_scope="compute")
 
         compare_with_cpu(fn, *self.inputs(), self.band(), run_eager=False)
 
@@ -229,6 +287,20 @@ class _BodyLadder:
         def fn(q, k, v, *block_bands):
             blocks = [
                 self.accumulated_block(q, k, v, band, n)
+                for n, band in enumerate(block_bands)
+            ]
+            return torch.cat(blocks, dim=2)
+
+        compare_with_cpu(fn, *self.inputs(), *bands, run_eager=False)
+
+    def test_g_the_loop_as_the_decomposition_writes_it(self):
+        # F plus the real hint placement: the closest this file gets to
+        # _window_roll_attention without going through the op itself.
+        bands = [self.band(n) for n in range(self.plan.num_q_blocks)]
+
+        def fn(q, k, v, *block_bands):
+            blocks = [
+                self.accumulated_block(q, k, v, band, n, hint_scope="compute")
                 for n, band in enumerate(block_bands)
             ]
             return torch.cat(blocks, dim=2)
