@@ -86,7 +86,7 @@ from .pass_utils import (
     iter_var_id,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
-from .views import matching_dim
+from .views import compute_coordinates, matching_dim
 
 # ---------------------------------------------------------------------------
 # TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
@@ -1581,6 +1581,7 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
 def _eager_view_input_layout(
     real_input: torch.Tensor,
     ptl: FixedLayout,
+    name: str,
 ) -> "FixedLayout | None":
     """Rewrite a placeholder view's FixedLayout to "layout = base, dep = view".
 
@@ -1631,14 +1632,75 @@ def _eager_view_input_layout(
         new_size = list(real_input.size())
         new_stride = list(real_input.stride())
 
-    # A stick-dim offset is no longer rejected here: it flows through the
+    # A stick-dim offset is no longer rejected outright: it flows through the
     # index-expression machinery and is resolved downstream by the same
     # restickify pass that handles intra-graph stick-dim slices (#2595) and
-    # mutation buffers (#2750). Cases with no offset-free alternative stick
-    # dim (e.g. no non-stick dim is a multiple of elem_in_stick) still reject
-    # cleanly downstream, and fixed-layout ops (matmul/topk/dtype-size change)
-    # reject in _check_supported_input_sticks -- so nothing silently
-    # miscomputes.
+    # mutation buffers (#2750). Fixed-layout ops (matmul/topk/dtype-size
+    # change) still reject in _check_supported_input_sticks.
+    #
+    # What is kept is the diagnostic. The device stick coordinate is computed
+    # with the same compute_coordinates()/is_stick_expr_offset_free()
+    # machinery compute_layouts() uses everywhere else (see
+    # _check_supported_input_sticks, _single_arg_op_layout) -- a flat
+    # host-offset heuristic can't see per-row stick padding, so the check has
+    # to happen in device space. When the coordinate carries an offset, the
+    # restickify pass must move the stick to another dim, and it can only
+    # target a dim whose size is a multiple of elem_in_stick (the #1756
+    # divisibility rule, enforced identically in _single_arg_op_layout and
+    # _alt_stick_dim_layouts). With no such dim there is no way to resolve it,
+    # so reject here where the graph input, its offset and its stick
+    # coordinate are all still in scope -- downstream the same case surfaces
+    # as a bare "no mechanism to resolve stick incompatibility" naming only an
+    # internal buffer.
+    #
+    # This check is strictly more permissive than the blanket gate it
+    # replaces (which rejected every offset-bearing stick coordinate), so it
+    # cannot reject anything that compiles today. It is still an
+    # approximation: it reasons about this input's own dims, while a consumer
+    # enumerates candidates over its *output* dims. A broadcast that
+    # introduces a divisible dim absent from this input would be admitted
+    # here and rejected downstream instead -- the reverse, a false rejection,
+    # would need that dim to be reachable on the input too, which
+    # compute_restickify_target_layout requires anyway.
+    stl = real_input.device_tensor_layout()
+    elem_in_stick = get_elem_in_stick(ptl.dtype)
+    rank = len(real_input.shape)
+    ivars = sympy.symbols(f"_offset_check_i0:{rank}", integer=True, nonnegative=True)
+    var_ranges = {v: s for v, s in zip(ivars, real_input.shape)}
+    flat_index = storage_offset + sum(new_stride[d] * ivars[d] for d in range(rank))
+    stick_expr = compute_coordinates(
+        list(stl.device_size), list(stl.stride_map), var_ranges, flat_index
+    )[-1]
+    if not is_stick_expr_offset_free(stick_expr, elem_in_stick):
+        stick_syms = stick_expr.free_symbols
+        stick_dim = next((d for d, v in enumerate(ivars) if v in stick_syms), None)
+        alt_dims = [
+            d
+            for d in range(rank)
+            if d != stick_dim and concretize_expr(new_size[d]) % elem_in_stick == 0
+        ]
+        if not alt_dims:
+            raise Unsupported(
+                f"graph input {name} has a device stick coordinate with a "
+                f"constant offset ({stick_expr}) at "
+                f"storage_offset={storage_offset}, and no other dimension of "
+                f"{list(new_size)} is a multiple of {elem_in_stick}, so the "
+                f"restickify pass has no alternative stick dimension to move "
+                f"it to (see issue #1756)"
+            )
+        logger.info(
+            "graph input %s has a device stick coordinate with a constant "
+            "offset (%s) at storage_offset=%s; the restickify pass must move "
+            "its stick from dim %s to one of dims %s. If compilation later "
+            "fails with 'no mechanism to resolve stick incompatibility', this "
+            "offset is the likely cause.",
+            name,
+            stick_expr,
+            storage_offset,
+            stick_dim,
+            alt_dims,
+        )
+
     return FixedLayout(
         device=ptl.device,
         dtype=ptl.dtype,
@@ -1675,7 +1737,7 @@ def propagate_spyre_tensor_layouts(
                 ptl = tb.data.data.layout
                 if not isinstance(ptl, FixedLayout):
                     raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                new_layout = _eager_view_input_layout(real_input, ptl)
+                new_layout = _eager_view_input_layout(real_input, ptl, name)
                 if new_layout is not None:
                     tb.data.data.layout = new_layout
                 tb.layouts = [stl]

@@ -5622,7 +5622,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         dev_view = slicer(base.clone().to("spyre"))
 
         with pytest.raises(
-            Exception, match="no mechanism to resolve stick incompatibility"
+            Exception, match="no alternative stick dimension to move it to"
         ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
@@ -5630,19 +5630,18 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         # Non-stick dim offset whose base row length isn't a multiple of
         # elem_in_stick: padding-aware device-coordinate construction not yet
         # implemented, so compute_coordinates leaks a spurious stick residual
-        # and the offset is misread as a stick-dim one. It now rejects
-        # downstream in the restickify pass (dim0=4 is not a multiple of
-        # elem_in_stick, so there is no alternative stick dim) rather than at
-        # the removed _eager_view_input_layout gate. Still a clean raise, not
-        # a miscompute. No eager arm: compile=False skips the Inductor pass
-        # entirely, so it can't exercise this check.
+        # and the offset is misread as a stick-dim one. dim0=4 is not a
+        # multiple of elem_in_stick either, so there is no alternative stick
+        # dim and it rejects with the same diagnostic. Still a clean raise,
+        # not a miscompute. No eager arm: compile=False skips the Inductor
+        # pass entirely, so it can't exercise this check.
         def fn(x):
             return x + x
 
         dev_view = slicer(base.clone().to("spyre"))
 
         with pytest.raises(
-            Exception, match="no mechanism to resolve stick incompatibility"
+            Exception, match="no alternative stick dimension to move it to"
         ):
             _compile_and_run(fn, [dev_view], "spyre", compile=True)
 
