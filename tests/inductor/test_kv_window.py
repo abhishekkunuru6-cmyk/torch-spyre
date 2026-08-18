@@ -45,6 +45,9 @@ import torch
 from torch_spyre._inductor.sliding_window_plan import (
     STICK,
     SlidingWindowPlan,
+    band_batch,
+    band_valid_start,
+    check_valid_start,
     check_window_read,
     default_buffer_origin,
     plan_sliding_window,
@@ -909,6 +912,38 @@ class TestKVWindowOp:
             return _reference_band(plan, 0)
 
         compare_with_cpu(fn, cache, cache, run_eager=False)
+
+
+class TestValidStart:
+    """The three torch-free helpers behind the valid_start band."""
+
+    def test_none_and_all_zero_mask_nothing(self):
+        # A caller with no padding must not pay for a per-batch band.
+        assert band_valid_start(None) is None
+        assert band_valid_start([]) is None
+        assert band_valid_start([0, 0]) is None
+        assert band_batch([0, 0]) == 1
+
+    def test_uniform_nonzero_stays_broadcast(self):
+        # Same threshold for every sequence: one row of band, broadcast over batch.
+        assert band_valid_start([40, 40]) == [40, 40]
+        assert band_batch([40, 40]) == 1
+
+    def test_ragged_widens_to_batch(self):
+        assert band_batch([0, 40]) == 2
+        assert band_batch([40, 40, 7]) == 3
+
+    def test_check_rejects_wrong_length(self):
+        assert "2 entries" in check_valid_start([0, 40], 3, 1088)
+
+    def test_check_rejects_out_of_range(self):
+        assert "outside" in check_valid_start([-1], 1, 1088)
+        assert "outside" in check_valid_start([1089], 1, 1088)
+
+    def test_check_accepts_valid(self):
+        assert check_valid_start(None, 4, 1088) is None
+        assert check_valid_start([0, 40], 2, 1088) is None
+        assert check_valid_start([1088], 1, 1088) is None
 
 
 if __name__ == "__main__":
