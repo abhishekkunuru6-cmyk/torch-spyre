@@ -20,6 +20,7 @@ from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops.fallbacks import warn_fallback
 
 from .errors import Unsupported
+from .sliding_window_plan import band_batch, band_valid_start
 
 aten = torch.ops.aten
 
@@ -892,6 +893,7 @@ def sliding_window_attention(  # type: ignore[empty-body]
     scale: Optional[float] = None,
     cache_seqlen: Optional[int] = None,
     buffer_origin: Optional[int] = None,
+    valid_start: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """
     Sliding-window attention entry point.
@@ -909,6 +911,15 @@ def sliding_window_attention(  # type: ignore[empty-body]
     A caller evicting at coarser granularity holds fewer live positions and
     MUST pass its true origin, or every read lands past the data, in bounds
     and unmasked. See ``SlidingWindowPlan`` for both.
+
+    ``valid_start`` is one **logical** column coordinate per batch entry;
+    columns strictly below it are never attended, whatever the window says. It
+    exists for left-padded prompts, whose pad columns sit inside the window and
+    which an offset-and-length window cannot otherwise exclude. ``None`` or
+    all-zero costs nothing; a uniform threshold keeps the band broadcast over
+    batch; only a ragged one widens it. Coordinates are logical, matching
+    ``cache_seqlen``, so a caller passing ``buffer_origin=0`` passes physical
+    row indices.
 
     Allocation contract: ``Lk >= round_up_to_64(window_size + Lq - 1)`` for
     the ``Lq`` of this call, so prefill long sequences in chunks;
@@ -934,6 +945,7 @@ def _(
     scale: Optional[float] = None,
     cache_seqlen: Optional[int] = None,
     buffer_origin: Optional[int] = None,
+    valid_start: Optional[list[int]] = None,
 ) -> torch.Tensor:
     return query.new_empty(query.size())
 
@@ -950,13 +962,16 @@ def window_band_mask(
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    valid_start: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """
     Additive band over one Q block's KV window.
 
-    Shape: [1, 1, q_block, buffer_width]; 0.0 = keep, -inf = masked. Both
-    leading axes are size 1 and broadcast over batch and heads, which keeps
-    this at q_block x buffer_width elements rather than one copy per head.
+    Shape: [1, 1, q_block, buffer_width] normally; the leading axis is 1
+    unless ``valid_start`` differs across the batch, in which case it is B.
+    0.0 = keep, -inf = masked. The head axis stays size 1 and broadcasts,
+    which keeps this at q_block x buffer_width elements per batch row rather
+    than one copy per head.
 
     Query row ``q_row_origin + i`` (an absolute KV-cache coordinate: row 0 of
     this block sits at ``seqlen_kv - seqlen_q + q_block*n``) may attend column
@@ -977,6 +992,9 @@ def window_band_mask(
     ``column < cache_seqlen``. Only a bidirectional window, which raises
     today, would need one.
 
+    ``valid_start``, if given, additionally excludes columns strictly below
+    its per-batch-entry threshold -- see ``sliding_window_attention``.
+
     Built entirely on CPU so the in-place ops stay opaque to torch.compile,
     matching spyre.causal_mask's rationale.
     """
@@ -987,9 +1005,18 @@ def window_band_mask(
         allowed = (delta >= 0) & (delta < window_size)
     else:
         allowed = delta.abs() < window_size
+    effective = band_valid_start(valid_start)
+    if effective is None:
+        allowed = allowed.unsqueeze(0)
+    elif min(effective) == max(effective):
+        # Uniform threshold: still one broadcast row, not one per sequence.
+        allowed = (allowed & (column.unsqueeze(0) >= effective[0])).unsqueeze(0)
+    else:
+        starts = torch.tensor(effective, device="cpu").view(-1, 1, 1)
+        allowed = allowed.unsqueeze(0) & (column.view(1, 1, -1) >= starts)
     mask_cpu = torch.zeros(allowed.shape, dtype=dtype, device="cpu")
     mask_cpu.masked_fill_(~allowed, float("-inf"))
-    return mask_cpu.unsqueeze(0).unsqueeze(0).to(device=device)
+    return mask_cpu.unsqueeze(1).to(device=device)
 
 
 @window_band_mask.register_fake
@@ -1002,8 +1029,11 @@ def _(
     is_causal: bool,
     dtype: torch.dtype,
     device: torch.device,
+    valid_start: Optional[list[int]] = None,
 ) -> torch.Tensor:
-    return torch.empty(1, 1, q_block, buffer_width, dtype=dtype, device=device)
+    return torch.empty(
+        band_batch(valid_start), 1, q_block, buffer_width, dtype=dtype, device=device
+    )
 
 
 @torch.library.custom_op("spyre::kv_window", mutates_args=(), device_types="spyre")

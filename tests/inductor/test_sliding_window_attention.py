@@ -147,6 +147,36 @@ def _rolled_reference(query, key, value, window_size, cache_seqlen, buffer_origi
     )
 
 
+def _reference_with_valid_start(query, key, value, window_size, valid_start):
+    """``_rolled_reference`` for an exactly-full buffer, additionally excluding
+    physical rows below ``valid_start`` -- the left-padding an offset-and-length
+    window cannot express.
+
+    One threshold per batch entry, so ``valid_start`` is a list even when uniform.
+    """
+    seqlen_q, capacity = query.size(2), key.size(2)
+    rows = torch.arange(seqlen_q) + (capacity - seqlen_q)
+    columns = torch.arange(capacity)
+    delta = rows.unsqueeze(-1) - columns.unsqueeze(0)
+    allowed = (delta >= 0) & (delta < window_size)
+    starts = torch.tensor(valid_start).view(-1, 1, 1)
+    allowed = allowed.unsqueeze(0) & (columns.view(1, 1, -1) >= starts)
+    mask = torch.zeros(allowed.shape, dtype=query.dtype)
+    mask.masked_fill_(~allowed, float("-inf"))
+    return F.scaled_dot_product_attention(
+        query, key, value, attn_mask=mask.unsqueeze(1)
+    )
+
+
+def _valid_start_attention(q, k, v, window_size, valid_start):
+    """The op with an explicit valid_start on spyre, the reference on CPU."""
+    if q.device.type == "spyre":
+        return torch.ops.spyre.sliding_window_attention(
+            q, k, v, window_size, True, None, k.size(2), 0, valid_start
+        )
+    return _reference_with_valid_start(q, k, v, window_size, valid_start)
+
+
 def _rolled_attention(q, k, v, window_size, cache_seqlen, buffer_origin=None):
     """Dispatch for a compact cache: the op on spyre with an explicit
     ``cache_seqlen`` (it cannot default to ``k.size(2)`` here -- that IS the
@@ -373,6 +403,37 @@ class TestCompactCache(unittest.TestCase):
         compare_with_cpu(
             _rolled_attention, query, key, value, 1024, 1088, run_eager=False
         )
+
+    def test_valid_start_excludes_padded_columns(self):
+        # 17 rows of left padding inside the window: without valid_start they are
+        # attended, and the reference proves the difference is visible.
+        key, value = _compact_kv(1, 8, 1088, 1088)
+        query = cached_randn((1, 8, 64, 64), differentiation=1, dtype=torch.float16)
+        compare_with_cpu(
+            _valid_start_attention, query, key, value, 1024, [17], run_eager=False
+        )
+
+    def test_valid_start_per_sequence(self):
+        # Ragged batch: the band widens to [B, 1, q, W'] only for this case.
+        key, value = _compact_kv(2, 8, 1088, 1088)
+        query = cached_randn((2, 8, 64, 64), differentiation=1, dtype=torch.float16)
+        compare_with_cpu(
+            _valid_start_attention, query, key, value, 1024, [0, 40], run_eager=False
+        )
+
+    def test_all_zero_valid_start_matches_no_valid_start(self):
+        # The fast path must be numerically identical to passing nothing.
+        key, value = _compact_kv(1, 8, 1088, 1088)
+        query = cached_randn((1, 8, 64, 64), differentiation=1, dtype=torch.float16)
+
+        def attention(q, k, v, window_size):
+            if q.device.type == "spyre":
+                return torch.ops.spyre.sliding_window_attention(
+                    q, k, v, window_size, True, None, k.size(2), 0, [0]
+                )
+            return _rolled_reference(q, k, v, window_size, k.size(2))
+
+        compare_with_cpu(attention, query, key, value, 1024, run_eager=False)
 
 
 if __name__ == "__main__":

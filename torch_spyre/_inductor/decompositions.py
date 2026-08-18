@@ -36,6 +36,8 @@ from .constants import DEVICE_NAME, FP8_E4M3FN_MAX, FP8_E4M3FN_MIN
 from .errors import Unsupported
 from .sliding_window_plan import (
     SlidingWindowPlan,
+    band_valid_start,
+    check_valid_start,
     check_window_read,
     plan_sliding_window,
     query_blocking,
@@ -619,6 +621,7 @@ def _windowed_attention(
     plan: SlidingWindowPlan,
     scaling_factor: float,
     num_heads: int,
+    valid_start: list[int] | None = None,
 ) -> torch.Tensor:
     """spyre__sdpa_overrideable's body, tiled over buffer_width not max_seqlen_kv.
 
@@ -645,7 +648,12 @@ def _windowed_attention(
         k_win, v_win = torch.ops.spyre.kv_window(
             key, value, read_start, buffer_width, num_heads
         )
-        fully_attended = plan.block_is_fully_attended(block_index)
+        # A valid_start that masks anything makes the band load-bearing even for a
+        # block the window alone fully covers.
+        fully_attended = (
+            plan.block_is_fully_attended(block_index)
+            and band_valid_start(valid_start) is None
+        )
         band = (
             None
             if fully_attended
@@ -663,6 +671,7 @@ def _windowed_attention(
                 plan.is_causal,
                 query.dtype,
                 query.device,
+                valid_start,
             )
         )
         q_rows = query[:, :, q_start:q_end, :]
@@ -738,6 +747,7 @@ def spyre_sliding_window_attention(
     scale: float | None = None,
     cache_seqlen: int | None = None,
     buffer_origin: int | None = None,
+    valid_start: list[int] | None = None,
 ) -> torch.Tensor:
     """Sliding-window attention: each Q block attends only its own KV slice.
 
@@ -764,6 +774,10 @@ def spyre_sliding_window_attention(
     # truth for which geometries can be planned.
     if cache_seqlen is None:
         cache_seqlen = cache_capacity
+
+    reason = check_valid_start(valid_start, batch_size, cache_seqlen)
+    if reason is not None:
+        raise Unsupported(f"sliding_window_attention: {reason}")
 
     if scale is not None and scale < 0:
         # math.sqrt would otherwise raise a bare ValueError.
@@ -821,7 +835,9 @@ def spyre_sliding_window_attention(
             dim=2,
         )
 
-    output = _windowed_attention(query, key, value, plan, scaling_factor, num_heads)
+    output = _windowed_attention(
+        query, key, value, plan, scaling_factor, num_heads, valid_start
+    )
     return output[:, :, pad_rows:, :] if pad_rows else output
 
 

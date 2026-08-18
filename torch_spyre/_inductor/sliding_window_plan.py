@@ -451,12 +451,8 @@ def check_valid_start(
     if valid_start is None:
         return None
     if len(valid_start) != batch:
-        return (
-            f"valid_start has {len(valid_start)} entries for a batch of {batch}"
-        )
+        return f"valid_start has {len(valid_start)} entries for a batch of {batch}"
     for entry in valid_start:
         if entry < 0 or entry > cache_seqlen:
-            return (
-                f"valid_start={entry} outside [0, cache_seqlen={cache_seqlen}]"
-            )
+            return f"valid_start={entry} outside [0, cache_seqlen={cache_seqlen}]"
     return None
