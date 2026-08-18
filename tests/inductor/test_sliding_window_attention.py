@@ -254,6 +254,13 @@ class TestSlidingWindowAttention(unittest.TestCase):
         query, key, value = _inputs(1, 8, 2, 100, 512)
         compare_with_cpu(_attention, query, key, value, 100, run_eager=False)
 
+    def test_prefill_head_dim_256_gqa(self):
+        # Gemma 4's sliding layers: 16 query heads from 8 KV heads, head_dim 256,
+        # W=1024. head_dim 256 is four sticks per row where the rest of this file
+        # uses one or two, and kv_window hands back a transposed slice.
+        query, key, value = _inputs(1, 16, 8, 512, 512, head_dim=256)
+        compare_with_cpu(_attention, query, key, value, 1024, run_eager=False)
+
 
 class TestCompactCache(unittest.TestCase):
     """cache_seqlen != key.size(2): a compact cache, rolled or still filling.
@@ -352,6 +359,19 @@ class TestCompactCache(unittest.TestCase):
         )
         compare_with_cpu(
             _rolled_attention, query, key, value, window, cache_seqlen, run_eager=False
+        )
+
+    def test_anchored_decode_gemma4(self):
+        # The exact geometry hf-adapters will call every decode step: a 1088-row
+        # compact buffer declared exactly full, and a single query row
+        # (seqlen_q=1) fed straight to the op. The anchored design dropped the
+        # 64-row query stick, so the real decode shape is (1, 16, 1, 256), with
+        # head_dim 256 and W=1024. This is the one shape that must be right for
+        # the integration to work at all.
+        key, value = _compact_kv(1, 8, 1088, 1088, head_dim=256)
+        query = cached_randn((1, 16, 1, 256), differentiation=1, dtype=torch.float16)
+        compare_with_cpu(
+            _rolled_attention, query, key, value, 1024, 1088, run_eager=False
         )
 
 
