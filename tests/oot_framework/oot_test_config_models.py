@@ -960,6 +960,16 @@ class InputsEdits(BaseModel):
                     and "cuda" in val
                 ):
                     val = test_device
+                # tensor.to(dtype) sample args serialize the dtype as a bare
+                # string (e.g. "torch.bfloat16"); resolve it back to a real
+                # torch.dtype so it isn't misread as a device string by
+                # Tensor.to() (see issue #3823).
+                elif (
+                    op_name == "torch.to"
+                    and isinstance(val, str)
+                    and val.startswith("torch.")
+                ):
+                    val = _resolve_dtype_str(val)
                 # Handle tuples/lists from YAML (e.g., view/reshape shapes)
                 # If value is a string that looks like a tuple/list, convert it
                 elif isinstance(val, str) and (
