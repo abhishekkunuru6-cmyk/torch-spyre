@@ -881,6 +881,200 @@ def _(
 
 
 @torch.library.custom_op(
+    "spyre::sliding_window_attention", mutates_args=(), device_types="spyre"
+)
+def sliding_window_attention(  # type: ignore[empty-body]
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    window_size: int,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+    cache_seqlen: Optional[int] = None,
+    buffer_origin: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Sliding-window attention entry point.
+
+    query: [B, Hq, Lq, D]; key/value: [B, Hkv, Lk, D], GQA expanded
+    internally. Query row i, at cache coordinate ``cache_seqlen - Lq + i``,
+    attends column c iff ``0 <= coordinate - c < window_size``.
+    ``is_causal=False`` raises Unsupported.
+
+    ``cache_seqlen`` is how many tokens the cache has seen, as distinct from
+    ``Lk``, the rows it allocates. Defaults to ``Lk``; need not be a multiple
+    of 64. ``buffer_origin`` is the logical position held by physical row 0,
+    defaulting to ``max(0, cache_seqlen - Lk)`` -- correct only for a buffer
+    that is exactly full, holding precisely the most recent ``Lk`` positions.
+    A caller evicting at coarser granularity holds fewer live positions and
+    MUST pass its true origin, or every read lands past the data, in bounds
+    and unmasked. See ``SlidingWindowPlan`` for both.
+
+    Allocation contract: ``Lk >= round_up_to_64(window_size + Lq - 1)`` for
+    the ``Lq`` of this call, so prefill long sequences in chunks;
+    ``rejection_reason`` names the required row count when ``Lk`` is short.
+    Zero-fill the allocation -- a buffer may overshoot the written prefix,
+    and though causal masking discards those scores the multiply still
+    happens, and an additive ``-inf`` cannot rescue a ``NaN``.
+
+    MUST be called under torch.compile(backend="inductor") on the spyre
+    device; the real lowering is in decompositions.py. This eager body is
+    intentionally empty, matching spyre::exx2 / spyre::layernormscale.
+    """
+    pass
+
+
+@sliding_window_attention.register_fake
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    window_size: int,
+    is_causal: bool = True,
+    scale: Optional[float] = None,
+    cache_seqlen: Optional[int] = None,
+    buffer_origin: Optional[int] = None,
+) -> torch.Tensor:
+    return query.new_empty(query.size())
+
+
+@torch.library.custom_op(
+    "spyre::window_band_mask", mutates_args=(), device_types="spyre"
+)
+def window_band_mask(
+    read_start: int,
+    q_block: int,
+    buffer_width: int,
+    q_row_origin: int,
+    window_size: int,
+    is_causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Additive band over one Q block's KV window.
+
+    Shape: [1, 1, q_block, buffer_width]; 0.0 = keep, -inf = masked. Both
+    leading axes are size 1 and broadcast over batch and heads, which keeps
+    this at q_block x buffer_width elements rather than one copy per head.
+
+    Query row ``q_row_origin + i`` (an absolute KV-cache coordinate: row 0 of
+    this block sits at ``seqlen_kv - seqlen_q + q_block*n``) may attend column
+    ``read_start + j`` iff, with ``delta`` the difference of those two absolute
+    coordinates:
+      - causal:        0 <= delta < window_size
+      - bidirectional: abs(delta) < window_size
+
+    The band removes what the buffer over-covers: the stagger between rows
+    inside the block, and the columns a shifted ragged window drags in.
+
+    ``read_start`` here is **logical** (``read_start_logical``), not
+    buffer-relative, since ``q_row_origin`` is logical and ``delta`` subtracts
+    the two.
+
+    No ``cache_seqlen`` term, deliberately: rows satisfy ``row < cache_seqlen``
+    by construction, so causal ``delta >= 0`` already forces
+    ``column < cache_seqlen``. Only a bidirectional window, which raises
+    today, would need one.
+
+    Built entirely on CPU so the in-place ops stay opaque to torch.compile,
+    matching spyre.causal_mask's rationale.
+    """
+    row = torch.arange(q_block, device="cpu") + q_row_origin
+    column = torch.arange(buffer_width, device="cpu") + read_start
+    delta = row.unsqueeze(-1) - column.unsqueeze(0)
+    if is_causal:
+        allowed = (delta >= 0) & (delta < window_size)
+    else:
+        allowed = delta.abs() < window_size
+    mask_cpu = torch.zeros(allowed.shape, dtype=dtype, device="cpu")
+    mask_cpu.masked_fill_(~allowed, float("-inf"))
+    return mask_cpu.unsqueeze(0).unsqueeze(0).to(device=device)
+
+
+@window_band_mask.register_fake
+def _(
+    read_start: int,
+    q_block: int,
+    buffer_width: int,
+    q_row_origin: int,
+    window_size: int,
+    is_causal: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    return torch.empty(1, 1, q_block, buffer_width, dtype=dtype, device=device)
+
+
+@torch.library.custom_op("spyre::kv_window", mutates_args=(), device_types="spyre")
+def kv_window(  # type: ignore[empty-body]
+    key: torch.Tensor,
+    value: torch.Tensor,
+    read_start: int,
+    buffer_width: int,
+    num_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Read one Q block's slice of the KV cache.
+
+    key/value: [B, Hkv, Lkv, E]. Returns (k_win, v_win) covering cache rows
+    [read_start, read_start + buffer_width). k_win is [B, Hq, E, buffer_width],
+    already **transposed** -- the layout the scores matmul wants, free on a
+    slice. GQA expansion to num_heads happens here, on the slice rather than
+    on the full cache.
+
+    One block per call; the memory planner reuses one window buffer across
+    them, so the cost is buffer_width rows for any query length.
+    ``read_start`` comes from SlidingWindowPlan, and ``check_window_read``
+    bounds it against the *allocation*, never the logical position -- a
+    still-filling read routinely runs past the written prefix, where causal
+    masking excludes the columns.
+
+    **Preconditions for a compact buffer** (``buffer_origin != 0``), neither
+    checked here since this op sees only offsets, never tokens: rows stay
+    contiguous and time-ordered, oldest at row 0, no ring/modulo indexing;
+    and physical row 0 holds exactly the ``buffer_origin`` the plan was
+    given. Maintaining that order is the caller's job and is unproven on this
+    backend -- ``aten::roll`` has no lowering, no Spyre decomposition and no
+    CPU fallback, and the narrow/cat route it would decompose to is suspect
+    (see ``TestKVWindowOp``).
+
+    MUST be called under torch.compile(backend="inductor") on the spyre
+    device; the real logic is the lowering in decompositions.py. This eager
+    body is intentionally empty.
+    """
+    pass
+
+
+@kv_window.register_fake
+def _(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    read_start: int,
+    buffer_width: int,
+    num_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from .sliding_window_plan import check_window_read
+
+    reason = check_window_read(
+        read_start=read_start,
+        buffer_width=buffer_width,
+        cache_capacity=key.size(2),
+        num_heads=num_heads,
+        num_kv_heads=key.size(1),
+        key_shape=tuple(key.shape),
+        value_shape=tuple(value.shape),
+    )
+    if reason is not None:
+        raise Unsupported(f"kv_window: {reason}")
+
+    batch, _, _, head_dim = key.shape
+    k_win = key.new_empty((batch, num_heads, head_dim, buffer_width))
+    v_win = value.new_empty((batch, num_heads, buffer_width, head_dim))
+    return k_win, v_win
+
+
+@torch.library.custom_op(
     "spyre::stagger_to_standard_ea", mutates_args=(), device_types="spyre"
 )
 def stagger_to_standard_ea(x: torch.Tensor) -> torch.Tensor:
