@@ -844,28 +844,23 @@ class TestKVWindowOp:
     """
 
     def test_window_and_band(self):
-        # All three outputs of one call, compared as a tuple so a failure names
-        # which of them was wrong. k and v hold different values (differentiation
-        # 1 vs 2), so a v_win sourced from the wrong tensor cannot pass by luck.
+        # All three outputs of one call, per block, so a failure names both which
+        # output was wrong and which block. Not cat-ed across blocks: that is the
+        # defect the class docstring describes, and nothing on this path does it.
         plan = _plan(256, 256, 64)
 
         def fn(k, v):
             blocks = range(plan.num_q_blocks)
             if k.device.type == "spyre":
                 return tuple(
-                    torch.cat(
-                        [_call_op(k, plan, n, which, value_cache=v) for n in blocks],
-                        dim=1,
-                    )
+                    _call_op(k, plan, n, which, value_cache=v)
                     for which in (0, 1, 2)
+                    for n in blocks
                 )
-            return (
-                torch.cat(
-                    [_reference_window(k, plan, n, transpose=True) for n in blocks],
-                    dim=1,
-                ),
-                torch.cat([_reference_window(v, plan, n) for n in blocks], dim=1),
-                torch.cat([_reference_band(plan, n) for n in blocks], dim=1),
+            return tuple(
+                [_reference_window(k, plan, n, transpose=True) for n in blocks]
+                + [_reference_window(v, plan, n) for n in blocks]
+                + [_reference_band(plan, n) for n in blocks]
             )
 
         compare_with_cpu(fn, _device_cache(1), _device_cache(2), run_eager=False)
