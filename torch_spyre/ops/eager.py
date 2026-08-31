@@ -17,12 +17,66 @@ from torch_spyre._C import fill_tensor, copy_tensor, SpyreTensorLayout
 import torch_spyre.ops.fallbacks  # noqa: F401
 from .fallbacks import _get_op_overloads
 import warnings
+import contextlib
 import functools
 import inspect
 import operator
+import threading
 
 
 aten = torch.ops.aten
+
+
+# Ops whose compiled kernel is running on this thread; see ``_guard_reentry``.
+_in_flight = threading.local()
+
+
+def _op_frame(op):
+    """Wrap ``op`` in a plain function that owns its dynamo cache line.
+
+    ``torch.compile`` on an ``OpOverload`` routes it through
+    ``torch._dynamo.external_utils.wrap_inline``, whose ``inner`` is one
+    module-level code object -- and dynamo caches per code object, so every
+    compiled op would otherwise share a single cache and recompile budget.
+    ``code.replace`` mints a distinct code object per op; the unchanged fields
+    are deliberate (upstream does the same for
+    ``config.debug_force_nested_calls``).
+    """
+
+    def call_op(*args, **kwargs):
+        return op(*args, **kwargs)
+
+    call_op.__code__ = call_op.__code__.replace(
+        co_varnames=call_op.__code__.co_varnames
+    )
+    return call_op
+
+
+@contextlib.contextmanager
+def _guard_reentry(op):
+    """Raise if ``op``'s compiled kernel re-dispatches to itself.
+
+    Only reachable when dynamo runs the frame eagerly instead of tracing it, so
+    the call loops back through this kernel. Unguarded it surfaces as an opaque
+    ``RecursionError`` in whatever ran out of stack first.
+    """
+    active = getattr(_in_flight, "ops", None)
+    if active is None:
+        active = set()
+        _in_flight.ops = active
+    if op in active:
+        raise RuntimeError(
+            f"the compiled Spyre kernel for {op} re-entered itself: dynamo "
+            "ran the op eagerly instead of tracing it, so it dispatched back "
+            "into this kernel. Check the log for 'torch._dynamo hit "
+            "config.accumulated_recompile_limit' and whether dynamo is "
+            "disabled (TORCHDYNAMO_DISABLE)."
+        )
+    active.add(op)
+    try:
+        yield
+    finally:
+        active.discard(op)
 
 
 # Decorator to keep track of compiled variant
@@ -37,8 +91,9 @@ def compile_once(op, **compile_kwargs):
             if compiled is None:
                 if isinstance(op, str):
                     op = operator.attrgetter(op)(torch.ops)
-                compiled = torch.compile(op, **compile_kwargs)
-            return fn(*args, compiled=compiled, **kwargs)
+                compiled = torch.compile(_op_frame(op), **compile_kwargs)
+            with _guard_reentry(op):
+                return fn(*args, compiled=compiled, **kwargs)
 
         # We remove the `compiled` arg from the signature to have
         # a clean signature.
