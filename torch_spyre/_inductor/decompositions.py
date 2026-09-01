@@ -699,21 +699,21 @@ def _windowed_attention(
                         exp_scores = torch.exp(scores - max_running.unsqueeze(-1))
                         correction = torch.exp(running_max - max_running)
 
-                        denominator = torch.ops.spyre.opaque_copy_(
+                        denominator = torch.ops.spyre.copy_forced(
                             denominator * correction + exp_scores.sum(dim=-1),
                             denominator,
                         )
-                        output = torch.ops.spyre.opaque_copy_(
+                        output = torch.ops.spyre.copy_forced(
                             output * correction.unsqueeze(-1)
                             + torch.matmul(exp_scores, v_win),
                             output,
                         )
-                        running_max = torch.ops.spyre.opaque_copy_(
+                        running_max = torch.ops.spyre.copy_forced(
                             max_running, running_max
                         )
 
         out_blocks.append(
-            torch.ops.spyre.opaque_copy_(output / denominator.unsqueeze(-1), output)
+            torch.ops.spyre.copy_forced(output / denominator.unsqueeze(-1), output)
         )
 
     return torch.cat(out_blocks, dim=2)
