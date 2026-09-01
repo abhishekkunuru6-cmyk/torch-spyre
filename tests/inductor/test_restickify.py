@@ -564,6 +564,42 @@ def test_bmm_xt_yt(bmm_tensors_ab_ba):
     _compare(lambda x, y: torch.matmul(x.transpose(1, 2), y.transpose(1, 2)), x, y)
 
 
+@pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
+def test_matmul_unit_n_2d():
+    """2D matmul where N=1 (output is a column vector)."""
+    x = torch.rand(5, 64, dtype=torch.float16)
+    y = torch.rand(64, 1, dtype=torch.float16)
+    _compare(lambda x, y: x @ y, x, y)
+
+
+@pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
+def test_matmul_unit_n_2d_reduce():
+    """2D matmul where Y is sparse"""
+    x = torch.rand(5, 64, dtype=torch.float16)
+    y = torch.rand(64, 64, dtype=torch.float16)
+    _compare(lambda x, y: x @ y.sum(dim=-1, keepdim=True), x, y)
+
+
+@pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
+def test_bmm_unit_n():
+    """Batched matmul with N=1 output dimension (decode-style query matmul).
+
+    Both x and y are (32, 1, 128); y is transposed before the matmul giving
+    out: (32, 1, 1).  When N=1 the N symbol is constant-folded away, producing
+    a sparse y layout.  Verifies the compiler handles it correctly.
+    """
+    x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    y = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x, y: torch.matmul(x, y.transpose(1, 2)), x, y)
+
+
+@pytest.mark.xfail(reason="Matmul with size 1 dims not yet supported")
+def test_bmm_unit_n_self():
+    """same tensor to matmul with and without transpose"""
+    x = torch.randn((32, 1, 128), dtype=torch.float16) * 0.1
+    _compare(lambda x: torch.matmul(x, x.transpose(1, 2)), x)
+
+
 # ------- FallbackKernel + restickify regression test ---------
 
 
@@ -2358,6 +2394,25 @@ def test_restickify_coverage_gap(shape):
 
     x = _arange(*shape, span=511)
     _strict(lambda t: (t + t).transpose(0, -1).contiguous(), x)
+
+
+# Broadcasting an elided size-one axis into a new stick is an identity fill.
+_BROADCAST_INTO_STICK_SHAPES = [
+    ((1, 8, 1), 64),
+    ((1, 8, 1), 67),
+    ((3, 5, 1), 64),
+    ((1, 1, 1), 64),
+]
+
+
+@pytest.mark.parametrize(
+    "shape,bwidth",
+    _BROADCAST_INTO_STICK_SHAPES,
+    ids=[f"{'x'.join(map(str, s))}_b{b}" for s, b in _BROADCAST_INTO_STICK_SHAPES],
+)
+def test_restickify_broadcast_into_stick(shape, bwidth):
+    x = _arange(*shape, span=511)
+    _strict(lambda t: t.expand(*shape[:-1], bwidth).contiguous(), x)
 
 
 # --------------------------------------------------------------------------

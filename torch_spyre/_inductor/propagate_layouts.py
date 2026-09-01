@@ -773,12 +773,19 @@ def _find_layout_avoiding_var_on_stick(
        off the stick, onto a surviving coordinate.
     3. Else raise Unsupported.
     """
+    constant_stick = None
     for stl in arg.layouts:
         dev_coords = device_coordinates(stl, arg.dep, None)
         if dev_coords is None:
             continue
-        if avoid_var not in dev_coords[-1].free_symbols:
-            return stl
+        stick_vars = dev_coords[-1].free_symbols
+        if avoid_var not in stick_vars:
+            if stick_vars:
+                return stl
+            constant_stick = stl
+
+    if constant_stick is not None:
+        return constant_stick
 
     arg_host_coords = host_coordinates(arg.layout, arg.dep, None)
     surviving_vars = set()
@@ -824,6 +831,21 @@ def find_stick_compatible_input_layout(
     2. Else return the first layout that can be restickified to put reduction_var on the stick.
     3. Else raise Unsupported.
     """
+    logger.debug(
+        "[find_stick_compatible_input_layout] label=%r reduction_type=%r\n"
+        "  arg.dep.name      = %s\n"
+        "  reduction_var     = %s\n"
+        "  arg.layout.size   = %s\n"
+        "  arg.layout.stride = %s\n"
+        "  arg.layouts       = %s",
+        label,
+        reduction_type,
+        arg.dep.name,
+        reduction_var,
+        list(arg.layout.size),
+        list(arg.layout.stride),
+        arg.layouts,
+    )
     # Skip candidates whose stick expression the backend cannot represent
     # (e.g. floor(var/N) from a cross-stick access); they are not usable inputs
     # and another candidate may work.
@@ -877,6 +899,45 @@ def _matmul_layouts(
     data = op.data
     _check_supported_input_sticks(args, data.reduction_type)
     out_coords = host_coordinates(output, output_dep, None)
+
+    logger.debug(
+        "[_matmul_layouts] output (%s):\n"
+        "  host size   = %s\n"
+        "  host stride = %s\n"
+        "  dep ranges  = %s\n"
+        "  dep index   = %s\n"
+        "  host coords = %s",
+        output_dep.name,
+        list(output.size),
+        list(output.stride),
+        dict(output_dep.ranges),
+        output_dep.index,
+        out_coords,
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        for i, arg in enumerate(args):
+            stl = arg.layouts[0]
+            h_coords = host_coordinates(arg.layout, arg.dep, None)
+            d_coords = device_coordinates(stl, arg.dep, None)
+            logger.debug(
+                "[_matmul_layouts] input[%d] (%s):\n"
+                "  host size   = %s\n"
+                "  host stride = %s\n"
+                "  dep ranges  = %s\n"
+                "  dep index   = %s\n"
+                "  STL         = %s\n"
+                "  host coords = %s\n"
+                "  dev coords  = %s",
+                i,
+                arg.dep.name,
+                list(arg.layout.size),
+                list(arg.layout.stride),
+                dict(arg.dep.ranges),
+                arg.dep.index,
+                stl,
+                h_coords,
+                d_coords,
+            )
 
     x_dep, y_dep = identify_matmul_inputs([a.dep for a in args], output_dep)
     if x_dep is None or y_dep is None:
@@ -1052,15 +1113,12 @@ def _multi_arg_pointwise_layouts(
     #   2a. >1 distinct staggered EA                -> unsupported (raise)
     #   2b. one staggered EA, no STANDARD operands  -> staggered output (via 3.1)
     #   3.  one staggered EA mixed with STANDARD operands:
-    #       3.2 every staggered operand can broadcast  -> STANDARD output
     #       3.1 every STANDARD operand can broadcast   -> staggered output
+    #       3.2 every staggered operand can broadcast  -> STANDARD output
     #       3.3 otherwise (a STANDARD and a staggered full operand coexist)
     #                                                  -> unsupported (raise)
-    # 3.2 is checked BEFORE 3.1: when every staggered operand is a size-1-stick
-    # broadcaster it carries no ordering, so the op is representable as an
-    # all-STANDARD broadcast, and a STANDARD output is preferred even when the
-    # STANDARD operands are also broadcastable (the overlap) -- it avoids a
-    # downstream back-conversion and the staggered operands are degenerate anyway.
+    # Prefer 3.1 in the overlap because propagation does not yet know which
+    # candidate layout the optimizer will commit for the staggered producer.
     # A future extension may admit 2a/3.3 by inserting an explicit EA conversion
     # at extra cost.
     staggered_inputs = input_eas & STAGGERED_EAS
@@ -1109,11 +1167,17 @@ def _multi_arg_pointwise_layouts(
             if arg.layouts and arg.layouts[0].element_arrangement == staggered_ea
         ]
 
-        if stag_split and all(broadcast for _, broadcast, _ in stag_split):
-            # Case 3.2 (checked before 3.1): every staggered operand is a size-1-
-            # stick broadcaster, so none carries a real ordering. Treat the op as
-            # an all-STANDARD broadcast (STANDARD output), preferred even in the
-            # overlap where the STANDARD operands also broadcast.
+        if all(broadcast for _, broadcast, _ in std_split):
+            # Case 3.1 (and case 2b with no STANDARD operands): preserve the
+            # staggered arrangement and keep only broadcast-compatible STANDARD
+            # candidates.
+            output_ea = staggered_ea
+            for arg, broadcast, non_broadcast in std_split:
+                if non_broadcast:
+                    arg.layouts[:] = broadcast
+        elif stag_split and all(broadcast for _, broadcast, _ in stag_split):
+            # Case 3.2: every staggered operand has a broadcast candidate, so
+            # the operation can use STANDARD ordering.
             #
             # Safety: device coordinates depend only on device_size/stride_map,
             # not the EA label (see device_coordinates), and `_is_supported_layout`
@@ -1156,16 +1220,6 @@ def _multi_arg_pointwise_layouts(
                 if non_broadcast:
                     arg.layouts[:] = broadcast
             staggered_inputs = set()
-        elif all(broadcast for _, broadcast, _ in std_split):
-            # Case 3.1 (and, vacuously, case 2b when there are no STANDARD
-            # operands): a genuine (full) staggered operand dictates the
-            # arrangement and every STANDARD operand broadcasts against it. Keep
-            # the staggered candidates and prune each STANDARD operand to its
-            # broadcast candidates; the output stays staggered.
-            output_ea = staggered_ea
-            for arg, broadcast, non_broadcast in std_split:
-                if non_broadcast:
-                    arg.layouts[:] = broadcast
         else:
             # Case 3.3: a STANDARD operand and a staggered operand are both
             # non-broadcast full tensors — a genuine mixed-order op we cannot
