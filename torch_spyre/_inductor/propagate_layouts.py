@@ -2134,16 +2134,16 @@ def _eager_view_input_layout(
         new_size = list(real_input.size())
         new_stride = list(real_input.stride())
 
-    # Verify the offset is device-stick-aligned by computing the real
-    # device stick coordinate for a full read of this view, using the same
-    # device-coordinate machinery (compute_coordinates +
-    # is_stick_expr_offset_free) already relied on elsewhere in this module
-    # for equivalent checks. A flat host-offset heuristic can't see per-row
-    # stick padding -- a row boundary can be device-stick-aligned even when
-    # the row length itself isn't a multiple of elem_in_stick -- so the check
-    # has to happen in device space, not host space.
-    # TODO: unaligned stick-dim offsets need alt-layout retargeting;
-    # currently rejected to avoid silent miscompute downstream.
+    # An offset landing inside the stick dimension is resolved downstream by
+    # the restickify pass, which moves the stick to another dimension (padding
+    # one to a stick boundary if none is already a multiple of elem_in_stick).
+    # Fixed-layout ops still reject in _check_supported_input_sticks.
+    #
+    # The stick coordinate is computed here only for the diagnostic -- a flat
+    # host-offset heuristic can't see per-row stick padding, so the question
+    # has to be asked in device space.  Admission is left to the passes that
+    # own the policy; this function sees only the input's own dims, while a
+    # consumer enumerates candidates over its output dims.
     stl = real_input.device_tensor_layout()
     elem_in_stick = get_elem_in_stick(ptl.dtype)
     rank = len(real_input.shape)
@@ -2154,10 +2154,13 @@ def _eager_view_input_layout(
         list(stl.device_size), list(stl.stride_map), var_ranges, flat_index
     )[-1]
     if not is_stick_expr_offset_free(stick_expr, elem_in_stick):
-        raise Unsupported(
-            f"graph input {name} has a non-stick-aligned device stick "
-            f"coordinate ({stick_expr}) at storage_offset={storage_offset}; "
-            f"not yet supported"
+        logger.info(
+            "graph input %s: stick coordinate %s carries an offset at "
+            "storage_offset=%s; the restickify pass must move its stick to "
+            "another dimension.",
+            name,
+            stick_expr,
+            storage_offset,
         )
 
     return FixedLayout(
