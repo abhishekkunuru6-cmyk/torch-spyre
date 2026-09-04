@@ -2160,9 +2160,10 @@ def _eager_view_input_layout(
     if not is_stick_expr_offset_free(stick_expr, elem_in_stick):
         logger.info(
             "graph input %s: offset %s lands inside the stick dim (stick "
-            "coord %s); restickifying to another dim costs runtime data "
-            "movement -- giving this input a layout whose stick dim is not "
-            "sliced will perform faster.",
+            "coord %s); the input is restickified onto another dim to serve "
+            "the slice, at the cost of extra data movement.  Passing this "
+            "input with a layout whose stick dim is not sliced avoids the "
+            "restickify.",
             name,
             storage_offset,
             stick_expr,
