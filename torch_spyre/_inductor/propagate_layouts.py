@@ -2137,6 +2137,8 @@ def _eager_view_input_layout(
     # An offset landing inside the stick dimension is resolved downstream by
     # the restickify pass, which moves the stick to another dimension (padding
     # one to a stick boundary if none is already a multiple of elem_in_stick).
+    # That costs runtime data movement, which the caller can avoid by picking
+    # a device layout for this input whose stick dim isn't the sliced one.
     # Fixed-layout ops still reject in _check_supported_input_sticks.
     #
     # The stick coordinate is computed here only for the diagnostic -- a flat
@@ -2155,12 +2157,13 @@ def _eager_view_input_layout(
     )[-1]
     if not is_stick_expr_offset_free(stick_expr, elem_in_stick):
         logger.info(
-            "graph input %s: stick coordinate %s carries an offset at "
-            "storage_offset=%s; the restickify pass must move its stick to "
-            "another dimension.",
+            "graph input %s: offset %s lands inside the stick dim (stick "
+            "coord %s); restickifying to another dim costs runtime data "
+            "movement -- giving this input a layout whose stick dim is not "
+            "sliced will perform faster.",
             name,
-            stick_expr,
             storage_offset,
+            stick_expr,
         )
 
     return FixedLayout(
