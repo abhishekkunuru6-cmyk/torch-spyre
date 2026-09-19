@@ -40,7 +40,11 @@ def _op_frame(op):
     compiled op would otherwise share a single cache and recompile budget.
     ``code.replace`` mints a distinct code object per op; the unchanged fields
     are deliberate (upstream does the same for
-    ``config.debug_force_nested_calls``).
+    ``config.debug_force_nested_calls``). CPython never interns code objects
+    by content the way it does small ints/strings, so this doesn't rely on an
+    accident of the current implementation -- and if that ever changed,
+    upstream's own ``debug_force_nested_calls`` use of the identical trick
+    would break the same way, not just this one.
     """
 
     def call_op(*args, **kwargs):
@@ -49,6 +53,10 @@ def _op_frame(op):
     call_op.__code__ = call_op.__code__.replace(
         co_varnames=call_op.__code__.co_varnames
     )
+    # Distinct __qualname__ per op so dynamo's recompile-limit log messages
+    # ("function: '<name>' ...") name the op that hit its budget, instead of
+    # every op showing up as the same generic 'call_op'.
+    call_op.__qualname__ = f"_op_frame.<locals>.{op.name()}"
     return call_op
 
 
