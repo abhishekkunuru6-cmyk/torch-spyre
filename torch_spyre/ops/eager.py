@@ -55,8 +55,13 @@ def _op_frame(op):
     )
     # Distinct __qualname__ per op so dynamo's recompile-limit log messages
     # ("function: '<name>' ...") name the op that hit its budget, instead of
-    # every op showing up as the same generic 'call_op'.
-    call_op.__qualname__ = f"_op_frame.<locals>.{op.name()}"
+    # every op showing up as the same generic 'call_op'. str(), not .name():
+    # a single-overload custom op (e.g. spyre.quantize_weight_fp8_with_scale)
+    # resolves to an OpOverloadPacket, not an OpOverload, and
+    # OpOverloadPacket has no .name() -- attribute access falls through to
+    # __getattr__, which tries to resolve "name" as an overload and raises
+    # AttributeError. __str__ is defined on both and needs no such dispatch.
+    call_op.__qualname__ = f"_op_frame.<locals>.{op}"
     return call_op
 
 

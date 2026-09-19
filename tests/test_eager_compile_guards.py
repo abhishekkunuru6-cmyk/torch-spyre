@@ -51,6 +51,7 @@ import unittest
 import torch
 import torch._dynamo
 import torch._dynamo as dynamo
+import torch._ops
 
 # Read the guard registry off the live module at call time rather than binding
 # the name at import, so the assertions can never see a stale reference.
@@ -69,6 +70,15 @@ from torch_spyre.ops.eager import _guard_reentry, _op_frame
 # seed hook and eagerly initializes the Spyre VFIO device -- turning these
 # CPU-only tests into device tests that fail when a card is busy. Plain
 # unittest never seeds a device.
+
+
+# Single-overload fixture op: torch.ops.torch_spyre_test.single_overload_echo
+# is an OpOverloadPacket, matching the shape of every spyre::* custom op
+# (e.g. quantize_weight_fp8_with_scale) -- unlike torch.ops.aten.add.Tensor,
+# which is an explicit OpOverload. See test_single_overload_custom_op_gets_a_qualname.
+@torch.library.custom_op("torch_spyre_test::single_overload_echo", mutates_args=())
+def _single_overload_echo(x: torch.Tensor) -> torch.Tensor:
+    return x.clone()
 
 
 class TestDynamoCacheLimits(unittest.TestCase):
@@ -103,6 +113,22 @@ class TestPerOpCacheLine(unittest.TestCase):
         add = _op_frame(torch.ops.aten.add.Tensor)
         x, y = torch.ones(3), torch.full((3,), 2.0)
         torch.testing.assert_close(add(x, y, alpha=2), x + 2 * y)
+
+    def test_single_overload_custom_op_gets_a_qualname(self):
+        # torch.ops.<ns>.<name> for a single-overload custom op (e.g. every
+        # spyre::* op registered via torch.library.custom_op) is an
+        # OpOverloadPacket, not an OpOverload -- unlike aten.add.Tensor above.
+        # OpOverloadPacket has no .name(); attribute access falls through to
+        # __getattr__, which tries to resolve "name" as an overload name and
+        # raises AttributeError. Regression test for exactly that: stamping
+        # __qualname__ via op.name() blew up on spyre.quantize_weight_fp8_with_scale
+        # in hf-adapters CI with "has no overload name 'name'". str(op) works
+        # on both OpOverload and OpOverloadPacket.
+        op = torch.ops.torch_spyre_test.single_overload_echo
+        self.assertIsInstance(op, torch._ops.OpOverloadPacket)
+        frame = _op_frame(op)
+        self.assertEqual(frame.__qualname__, f"_op_frame.<locals>.{op}")
+        torch.testing.assert_close(frame(torch.ones(3)), torch.ones(3))
 
     def test_one_op_exhausting_its_budget_leaves_other_ops_compilable(self):
         graphs = []
